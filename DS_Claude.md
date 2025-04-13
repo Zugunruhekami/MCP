@@ -2130,3 +2130,548 @@ This design combines the strengths of all three implementations:
 - Hugging Face's focus on performance benchmarking
 
 The result is a flexible deep research platform that can handle different research needs while maintaining transparency about the research process.
+
+
+
+*Thinking...*
+
+> Let me create a detailed implementation of the `QuickAnswerGraph` class within the LangGraph framework. This will be inspired by the Jina AI's approach with the Search → Read → Reason loop.
+> 
+> I'll need to:
+> 1. Define the state structure
+> 2. Implement the necessary nodes (functions)
+> 3. Set up the edges between nodes with appropriate conditions
+> 4. Handle token budget tracking
+> 5. Implement search and content extraction
+> 6. Manage the reasoning process
+> 
+> Let's start by defining the state class and then implementing the full `QuickAnswerGraph` class.
+
+
+# Detailed Implementation of QuickAnswerGraph
+
+Here's a detailed implementation of the `QuickAnswerGraph` class using LangGraph:
+
+```python
+from typing import Dict, List, Optional, Any, Tuple, Literal, TypedDict, Union, Annotated, cast
+import uuid
+from pydantic import BaseModel, Field
+import asyncio
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint import MemorySaver
+
+class QuickAnswerState(BaseModel):
+    """State for the quick answer workflow"""
+    # Input and configuration
+    query: str = Field(description="The original user query")
+    token_budget: int = Field(default=8000, description="Maximum tokens to use")
+    tokens_used: int = Field(default=0, description="Tokens used so far")
+    
+    # Internal state
+    current_step: int = Field(default=0, description="Current reasoning step")
+    max_steps: int = Field(default=10, description="Maximum steps to take")
+    knowledge: List[str] = Field(default_factory=list, description="Knowledge gathered so far")
+    
+    # Search state
+    search_disabled: bool = Field(default=False, description="Whether search is disabled")
+    search_results: List[Dict] = Field(default_factory=list, description="Recent search results")
+    visited_urls: List[str] = Field(default_factory=list, description="URLs already visited")
+    url_queue: List[str] = Field(default_factory=list, description="URLs to visit")
+    
+    # Reasoning state
+    reasoning_history: List[str] = Field(default_factory=list, description="History of reasoning steps")
+    reasoning_disabled: bool = Field(default=False, description="Whether reasoning is disabled")
+    sub_questions: List[str] = Field(default_factory=list, description="Sub-questions identified")
+    
+    # Output
+    final_answer: Optional[str] = Field(default=None, description="Final answer to the query")
+    citations: List[Dict] = Field(default_factory=list, description="Citations for the final answer")
+
+class SearchResult(BaseModel):
+    """Structure for search results"""
+    title: str
+    url: str
+    snippet: str
+
+class WebContent(BaseModel):
+    """Structure for web content"""
+    url: str
+    content: str
+    title: str
+
+class ReasoningOutput(BaseModel):
+    """Structure for reasoning output"""
+    action: Literal["search", "visit", "answer", "think"]
+    thought: str
+    search_query: Optional[str] = None
+    urls_to_visit: Optional[List[str]] = None
+    answer: Optional[str] = None
+    citations: Optional[List[Dict]] = None
+    sub_questions: Optional[List[str]] = None
+    confidence: Optional[float] = None
+
+class QuickAnswerGraph:
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize the QuickAnswerGraph with configuration"""
+        self.config = config
+        self.llm_service = self._init_llm_service(config)
+        self.search_service = self._init_search_service(config)
+        self.content_service = self._init_content_service(config)
+        self.token_counter = self._init_token_counter(config)
+        self.graph = self._build_graph()
+        self.checkpointer = MemorySaver()
+    
+    def _init_llm_service(self, config):
+        """Initialize the LLM service based on configuration"""
+        provider = config.get("llm_provider", "openai")
+        model = config.get("llm_model", "gpt-4o")
+        
+        # Here you would have different implementations based on provider
+        if provider == "openai":
+            from app.services.llm.openai import OpenAIService
+            return OpenAIService(model=model)
+        elif provider == "anthropic":
+            from app.services.llm.anthropic import AnthropicService
+            return AnthropicService(model=model)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+    
+    def _init_search_service(self, config):
+        """Initialize the search service based on configuration"""
+        provider = config.get("search_provider", "tavily")
+        
+        if provider == "tavily":
+            from app.services.search.tavily import TavilySearchService
+            return TavilySearchService()
+        elif provider == "perplexity":
+            from app.services.search.perplexity import PerplexitySearchService
+            return PerplexitySearchService()
+        else:
+            raise ValueError(f"Unsupported search provider: {provider}")
+    
+    def _init_content_service(self, config):
+        """Initialize the content extraction service"""
+        from app.services.content.html_extractor import HTMLContentExtractor
+        return HTMLContentExtractor()
+    
+    def _init_token_counter(self, config):
+        """Initialize the token counter based on the model"""
+        from app.utils.token_counter import TokenCounter
+        return TokenCounter(model=config.get("llm_model", "gpt-4o"))
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the state graph for the quick answer workflow"""
+        # Create a new state graph
+        workflow = StateGraph(QuickAnswerState)
+        
+        # Add nodes to the graph
+        workflow.add_node("check_budget", self._check_budget)
+        workflow.add_node("decide_next_action", self._decide_next_action)
+        workflow.add_node("perform_search", self._perform_search)
+        workflow.add_node("visit_url", self._visit_url)
+        workflow.add_node("think", self._think)
+        workflow.add_node("generate_answer", self._generate_answer)
+        
+        # Set the entry point
+        workflow.set_entry_point("check_budget")
+        
+        # Define edges
+        # From budget check
+        workflow.add_edge("check_budget", "decide_next_action", condition=lambda state: state.tokens_used < state.token_budget)
+        workflow.add_edge("check_budget", "generate_answer", condition=lambda state: state.tokens_used >= state.token_budget)
+        
+        # From action decision
+        workflow.add_edge("decide_next_action", "perform_search", 
+                         condition=lambda state: state.reasoning_history[-1]["action"] == "search" if state.reasoning_history else False)
+        workflow.add_edge("decide_next_action", "visit_url", 
+                         condition=lambda state: state.reasoning_history[-1]["action"] == "visit" if state.reasoning_history else False)
+        workflow.add_edge("decide_next_action", "generate_answer", 
+                         condition=lambda state: state.reasoning_history[-1]["action"] == "answer" if state.reasoning_history else False)
+        workflow.add_edge("decide_next_action", "think", 
+                         condition=lambda state: state.reasoning_history[-1]["action"] == "think" if state.reasoning_history else False)
+        
+        # From search
+        workflow.add_edge("perform_search", "check_budget")
+        
+        # From URL visit
+        workflow.add_edge("visit_url", "check_budget")
+        
+        # From thinking
+        workflow.add_edge("think", "check_budget")
+        
+        # From answer generation to end
+        workflow.add_edge("generate_answer", END)
+        
+        return workflow.compile(checkpointer=self.checkpointer)
+    
+    async def _check_budget(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Check if we've exceeded the token budget or max steps"""
+        # Increment step counter
+        state.current_step += 1
+        
+        # If this is the first step, initialize reasoning with an empty action
+        if state.current_step == 1:
+            state.reasoning_history.append({
+                "action": "think",
+                "thought": "Let's start researching this query."
+            })
+        
+        # Check if we've reached the maximum number of steps
+        if state.current_step > state.max_steps:
+            # Force answer generation on next step
+            state.reasoning_history[-1]["action"] = "answer"
+            state.reasoning_history[-1]["thought"] = "Reached maximum number of steps. Generating best answer with current knowledge."
+        
+        return state
+    
+    async def _decide_next_action(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Decide the next action to take based on the current state"""
+        # Prepare the context from gathered knowledge
+        context = "\n\n".join(state.knowledge)
+        
+        # Create reasoning prompt
+        reasoning_prompt = f"""
+        You are a research assistant helping to answer the following question:
+        
+        QUESTION: {state.query}
+        
+        CURRENT KNOWLEDGE:
+        {context if context else "No knowledge gathered yet."}
+        
+        REASONING HISTORY:
+        {'\n'.join([f"Step {i+1}: {step['thought']}" for i, step in enumerate(state.reasoning_history)])}
+        
+        Based on the above, decide what action to take next:
+        1. "search" - Search the web for specific information (provide search query)
+        2. "visit" - Visit specific URLs to gather more information (provide URLs)
+        3. "think" - Reflect on the information and generate sub-questions
+        4. "answer" - Generate a final answer with citations
+        
+        IMPORTANT:
+        - Choose "search" when you need to find specific information
+        - Choose "visit" when you have URLs you want to explore
+        - Choose "think" when you need to analyze the information you have
+        - Choose "answer" only when you have enough information to answer the original question
+        
+        Your response should be structured as follows:
+        """
+        
+        # Use structured output for the LLM
+        reasoning_output = await self.llm_service.astructured_generate(
+            prompt=reasoning_prompt,
+            response_model=ReasoningOutput
+        )
+        
+        # Update token usage
+        prompt_tokens = self.token_counter.count_tokens(reasoning_prompt)
+        response_tokens = self.token_counter.count_tokens(str(reasoning_output))
+        state.tokens_used += prompt_tokens + response_tokens
+        
+        # Store the reasoning output in state
+        state.reasoning_history.append({
+            "action": reasoning_output.action,
+            "thought": reasoning_output.thought,
+            "search_query": reasoning_output.search_query,
+            "urls_to_visit": reasoning_output.urls_to_visit,
+            "answer": reasoning_output.answer,
+            "citations": reasoning_output.citations,
+            "sub_questions": reasoning_output.sub_questions,
+            "confidence": reasoning_output.confidence
+        })
+        
+        return state
+    
+    async def _perform_search(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Perform a web search based on the current query"""
+        # Get the search query from the latest reasoning
+        latest_reasoning = state.reasoning_history[-1]
+        search_query = latest_reasoning.get("search_query")
+        
+        if not search_query:
+            # If somehow there's no search query, fall back to the original query
+            search_query = state.query
+            
+        try:
+            # Perform the search
+            search_results = await self.search_service.asearch(
+                query=search_query,
+                num_results=5
+            )
+            
+            # Update state with search results
+            state.search_results = search_results
+            
+            # Extract URLs to visit
+            state.url_queue.extend([result.url for result in search_results 
+                                   if result.url not in state.visited_urls])
+            
+            # Add search results to knowledge
+            search_summary = f"Search results for '{search_query}':\n"
+            for result in search_results:
+                search_summary += f"- {result.title} ({result.url})\n  {result.snippet}\n"
+            
+            state.knowledge.append(search_summary)
+            
+            # If search found new URLs, add them to the queue for visiting
+            if state.url_queue and not latest_reasoning.get("urls_to_visit"):
+                latest_reasoning["urls_to_visit"] = state.url_queue[:3]  # Limit to 3 URLs
+            
+        except Exception as e:
+            # Handle search failures
+            error_msg = f"Search failed: {str(e)}"
+            state.knowledge.append(f"[ERROR] {error_msg}")
+            # Disable search for the next round if it consistently fails
+            state.search_disabled = True
+        
+        return state
+    
+    async def _visit_url(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Visit URLs to extract content"""
+        # Get URLs to visit from the latest reasoning
+        latest_reasoning = state.reasoning_history[-1]
+        urls_to_visit = latest_reasoning.get("urls_to_visit", [])
+        
+        # If no specific URLs were provided but we have a queue, use those
+        if not urls_to_visit and state.url_queue:
+            urls_to_visit = state.url_queue[:3]  # Limit to 3 URLs
+        
+        # Process each URL
+        for url in urls_to_visit:
+            if url in state.visited_urls:
+                continue  # Skip already visited URLs
+            
+            try:
+                # Extract content from the URL
+                content = await self.content_service.extract_content(url)
+                
+                # Add to visited URLs
+                state.visited_urls.append(url)
+                
+                # Remove from queue if present
+                if url in state.url_queue:
+                    state.url_queue.remove(url)
+                
+                # Create a summary of the content
+                content_summary = f"Content from {url}:\nTitle: {content.title}\n\n{content.content[:3000]}..."
+                
+                # Add to knowledge base
+                state.knowledge.append(content_summary)
+                
+                # Add as a potential citation
+                state.citations.append({
+                    "url": url,
+                    "title": content.title
+                })
+                
+            except Exception as e:
+                # Handle content extraction failures
+                error_msg = f"Failed to extract content from {url}: {str(e)}"
+                state.knowledge.append(f"[ERROR] {error_msg}")
+        
+        return state
+    
+    async def _think(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Think about the information gathered and identify sub-questions"""
+        # Get sub-questions from the latest reasoning
+        latest_reasoning = state.reasoning_history[-1]
+        sub_questions = latest_reasoning.get("sub_questions", [])
+        
+        if sub_questions:
+            # Add sub-questions to the state
+            for question in sub_questions:
+                if question not in state.sub_questions:
+                    state.sub_questions.append(question)
+        
+        # Create a synthesis of the information gathered so far
+        context = "\n\n".join(state.knowledge)
+        
+        synthesis_prompt = f"""
+        You are a research assistant analyzing information for the question:
+        
+        QUESTION: {state.query}
+        
+        INFORMATION GATHERED:
+        {context if context else "No information gathered yet."}
+        
+        SUB-QUESTIONS IDENTIFIED:
+        {', '.join(state.sub_questions) if state.sub_questions else "No sub-questions identified yet."}
+        
+        Please analyze this information and provide:
+        1. A concise synthesis of what we know so far
+        2. What information is still missing to answer the question
+        3. How confident you are that we can answer the original question with the current information
+        """
+        
+        # Generate a synthesis of the information
+        synthesis = await self.llm_service.agenerate(synthesis_prompt)
+        
+        # Add the synthesis to the knowledge base
+        state.knowledge.append(f"SYNTHESIS: {synthesis}")
+        
+        # Update token usage
+        prompt_tokens = self.token_counter.count_tokens(synthesis_prompt)
+        response_tokens = self.token_counter.count_tokens(synthesis)
+        state.tokens_used += prompt_tokens + response_tokens
+        
+        return state
+    
+    async def _generate_answer(self, state: QuickAnswerState) -> QuickAnswerState:
+        """Generate the final answer based on the knowledge gathered"""
+        # Prepare the context from gathered knowledge
+        context = "\n\n".join(state.knowledge)
+        
+        answer_prompt = f"""
+        You are a research assistant generating a final answer to the following question:
+        
+        QUESTION: {state.query}
+        
+        INFORMATION GATHERED:
+        {context}
+        
+        REASONING HISTORY:
+        {'\n'.join([f"Step {i+1}: {step['thought']}" for i, step in enumerate(state.reasoning_history)])}
+        
+        Please provide a comprehensive answer to the original question based on the information gathered.
+        
+        Your answer should:
+        1. Be directly responsive to the question
+        2. Synthesize information from multiple sources
+        3. Include citations to specific sources [^1], [^2], etc.
+        4. Acknowledge any limitations or uncertainties
+        
+        FORMAT:
+        - First provide your answer
+        - Then list your citations in the format:
+          [^1]: Title of source. URL
+        """
+        
+        # Generate the final answer
+        final_answer = await self.llm_service.agenerate(answer_prompt)
+        
+        # Update token usage
+        prompt_tokens = self.token_counter.count_tokens(answer_prompt)
+        response_tokens = self.token_counter.count_tokens(final_answer)
+        state.tokens_used += prompt_tokens + response_tokens
+        
+        # Set the final answer in the state
+        state.final_answer = final_answer
+        
+        return state
+    
+    async def arun(self, query: str, config: Optional[Dict[str, Any]] = None) -> Dict:
+        """Run the quick answer workflow"""
+        # Create a unique thread ID
+        thread_id = str(uuid.uuid4())
+        
+        # Merge configuration with defaults
+        run_config = {**self.config}
+        if config:
+            run_config.update(config)
+        
+        # Set up the initial state
+        initial_state = QuickAnswerState(
+            query=query,
+            token_budget=run_config.get("token_budget", 8000),
+            max_steps=run_config.get("max_steps", 10)
+        )
+        
+        # Run the graph
+        state_dict = {}
+        async for event in self.graph.astream(
+            initial_state,
+            stream_mode="updates",
+            config={"configurable": run_config},
+            thread_id=thread_id
+        ):
+            state_dict = event
+            
+            # Update UI here if needed in real-time
+            # await self._send_update(thread_id, event)
+        
+        # Extract the final result
+        result = {
+            "answer": state_dict["final_answer"],
+            "citations": state_dict["citations"],
+            "tokens_used": state_dict["tokens_used"],
+            "steps_taken": state_dict["current_step"],
+            "reasoning_history": state_dict["reasoning_history"]
+        }
+        
+        return result
+    
+    async def astream(self, query: str, config: Optional[Dict[str, Any]] = None):
+        """Stream the quick answer workflow"""
+        # Create a unique thread ID
+        thread_id = str(uuid.uuid4())
+        
+        # Merge configuration with defaults
+        run_config = {**self.config}
+        if config:
+            run_config.update(config)
+        
+        # Set up the initial state
+        initial_state = QuickAnswerState(
+            query=query,
+            token_budget=run_config.get("token_budget", 8000),
+            max_steps=run_config.get("max_steps", 10)
+        )
+        
+        # Stream the graph execution
+        async for event in self.graph.astream(
+            initial_state,
+            stream_mode="updates",
+            config={"configurable": run_config},
+            thread_id=thread_id
+        ):
+            yield event
+```
+
+## Explanation of Key Components
+
+### State Management
+
+The `QuickAnswerState` class defines the complete state of the research process, including:
+- Input query and configuration parameters
+- Token budget tracking
+- Knowledge accumulation
+- Search and URL management
+- Reasoning history
+- Final answer and citations
+
+### Core Workflow Nodes
+
+1. **Check Budget**: Monitors token usage and step count to prevent runaway processes
+2. **Decide Next Action**: Uses the LLM to determine whether to search, visit URLs, think, or generate an answer
+3. **Perform Search**: Executes web searches and adds results to knowledge
+4. **Visit URL**: Fetches and extracts content from web pages
+5. **Think**: Analyzes gathered information and identifies sub-questions
+6. **Generate Answer**: Creates a final, comprehensive answer with citations
+
+### Reasoning Process
+
+The implementation follows the Jina AI approach with a Search → Read → Reason loop:
+
+1. The LLM decides what action to take next based on current knowledge
+2. If searching, it formulates specific queries to find information
+3. If visiting URLs, it extracts and processes content from web pages
+4. If thinking, it synthesizes information and identifies gaps
+5. If answering, it generates a comprehensive response with citations
+
+### Token Budget Management
+
+- Tracks tokens used in LLM calls
+- Forces answer generation when the budget is exceeded
+- Allows configuration of token budget and maximum steps
+
+### Error Handling and Robustness
+
+- Handles search and content extraction failures
+- Falls back to alternative strategies when tools fail
+- Limits URL visits and search queries to prevent excessive API usage
+
+### Streaming Support
+
+The `astream` method provides real-time updates as the research progresses, which is essential for a responsive UI that shows the research process.
+
+This implementation creates a robust, configurable research agent that can explore the web, reason about information, and synthesize comprehensive answers to complex questions.
