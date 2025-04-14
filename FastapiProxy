@@ -987,3 +987,37 @@ async def mcp_stdio_endpoint(request: Request):
 # Import asyncio for the SSE generator
 import asyncio
 from fastapi.responses import StreamingResponse
+
+
+
+
+async def get_openapi_spec(base_url: str) -> dict:
+    """
+    Fetch the OpenAPI specification from a remote FastAPI server using httpx.
+    
+    Args:
+        base_url: The base URL of the FastAPI server
+    
+    Returns:
+        The OpenAPI specification as a Python dictionary
+    """
+    # Make sure the URL doesn't end with a slash
+    if base_url.endswith('/'):
+        base_url = base_url[:-1]
+    
+    openapi_url = f"{base_url}/openapi.json"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(openapi_url)
+            response.raise_for_status()  # Raise an exception for 4XX/5XX responses
+            return response.json()
+    except httpx.HTTPError as e:
+        print(f"HTTP error occurred: {e}")
+        raise
+    except json.JSONDecodeError:
+        print("Failed to decode JSON response")
+        raise
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        raise
