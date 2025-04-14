@@ -644,43 +644,346 @@ Each registered route will have the same path, method, and documentation as your
 
 
 
-
-from fastapi import FastAPI, Request
-from starlette.responses import StreamingResponse
+import json
 import httpx
+from fastapi import FastAPI, Request, Response, HTTPException, Body
+from fastapi.responses import JSONResponse
+from pydantic import create_model, BaseModel, Field
+from typing import Dict, List, Any, Optional, Union, get_type_hints, Type
+import inspect
+from enum import Enum
 
-app = FastAPI(title="MCP Server")
+# Create the FastAPI app
+app = FastAPI(title="MCP Server Proxy")
+
+# Original API URL
 ORIGINAL_API_URL = "http://localhost:8000"
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
-async def proxy(request: Request, path: str):
-    url = f"{ORIGINAL_API_URL}/{path}"
+# Cache for OpenAPI spec
+openapi_cache = None
+
+async def get_openapi_spec():
+    global openapi_cache
+    if openapi_cache is not None:
+        return openapi_cache
     
-    # Get query parameters
-    query_params = str(request.url.query)
-    if query_params:
-        url = f"{url}?{query_params}"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{ORIGINAL_API_URL}/openapi.json")
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch OpenAPI spec: {response.status_code}")
+        openapi_cache = response.json()
+        return openapi_cache
+
+# Convert OpenAPI schemas to Pydantic models
+def create_pydantic_model_from_schema(schema, name):
+    if not schema:
+        return None
+    
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    fields = {}
+    
+    for prop_name, prop_schema in properties.items():
+        field_type = Any
+        field_kwargs = {}
         
-    # Get headers (excluding host)
+        if "type" in prop_schema:
+            if prop_schema["type"] == "string":
+                field_type = str
+            elif prop_schema["type"] == "integer":
+                field_type = int
+            elif prop_schema["type"] == "number":
+                field_type = float
+            elif prop_schema["type"] == "boolean":
+                field_type = bool
+            elif prop_schema["type"] == "array":
+                field_type = List[Any]
+            elif prop_schema["type"] == "object":
+                field_type = Dict[str, Any]
+        
+        if "description" in prop_schema:
+            field_kwargs["description"] = prop_schema["description"]
+        
+        if prop_name not in required:
+            field_type = Optional[field_type]
+            field_kwargs["default"] = None
+        
+        fields[prop_name] = (field_type, Field(**field_kwargs))
+    
+    return create_model(name, **fields)
+
+# Create MCP tool definitions from OpenAPI paths
+async def create_mcp_tools():
+    spec = await get_openapi_spec()
+    tools = []
+    
+    for path, path_item in spec.get("paths", {}).items():
+        for method, operation in path_item.items():
+            if method.lower() not in ["get", "post", "put", "delete", "patch"]:
+                continue
+                
+            operation_id = operation.get("operationId", f"{method}_{path}")
+            
+            # Create parameter schema
+            parameters = []
+            for param in operation.get("parameters", []):
+                parameters.append({
+                    "name": param["name"],
+                    "description": param.get("description", ""),
+                    "type": param["schema"].get("type", "string"),
+                    "required": param.get("required", False)
+                })
+            
+            # Handle request body
+            if "requestBody" in operation:
+                content = operation["requestBody"].get("content", {})
+                schema = None
+                
+                # Try to get schema from application/json or first available content type
+                if "application/json" in content:
+                    schema = content["application/json"].get("schema", {})
+                elif content:
+                    first_content = next(iter(content.values()))
+                    schema = first_content.get("schema", {})
+                
+                if schema:
+                    for prop_name, prop_schema in schema.get("properties", {}).items():
+                        param = {
+                            "name": prop_name,
+                            "description": prop_schema.get("description", ""),
+                            "type": prop_schema.get("type", "string"),
+                            "required": prop_name in schema.get("required", [])
+                        }
+                        parameters.append(param)
+            
+            # Create tool definition
+            tool = {
+                "name": operation_id,
+                "description": operation.get("summary", "") or operation.get("description", ""),
+                "parameters": parameters
+            }
+            tools.append(tool)
+    
+    return tools
+
+# Proxy handler for API requests
+async def proxy_request(path: str, method: str, request: Request):
+    # Get request body if needed
+    body = await request.body() if method.lower() in ["post", "put", "patch"] else None
+    
+    # Build target URL with query parameters
+    query_params = str(request.url.query)
+    query_string = f"?{query_params}" if query_params else ""
+    target_url = f"{ORIGINAL_API_URL}{path}{query_string}"
+    
+    # Forward headers (excluding host)
     headers = dict(request.headers)
     if "host" in headers:
         del headers["host"]
-        
-    # Get body content
-    body = await request.body()
     
-    # Forward request to original API
+    # Forward the request to the original server
     async with httpx.AsyncClient() as client:
-        response = await client.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body or None
-        )
+        try:
+            response = await client.request(
+                method=method.upper(),
+                url=target_url,
+                headers=headers,
+                content=body
+            )
+            
+            # Return the response from the original server
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=500, detail=f"Proxy request failed: {str(e)}")
+
+# Create routes from OpenAPI spec
+@app.on_event("startup")
+async def setup_routes():
+    spec = await get_openapi_spec()
+    
+    # Register API routes from the spec
+    for path, path_item in spec.get("paths", {}).items():
+        for method, operation in path_item.items():
+            if method.lower() not in ["get", "post", "put", "delete", "patch", "options", "head"]:
+                continue
+                
+            operation_id = operation.get("operationId", f"{method}_{path.replace('/', '_')}")
+            
+            # Create the route
+            async def route_handler(request: Request, path=path, method=method):
+                return await proxy_request(path, method, request)
+            
+            route_handler.__name__ = operation_id
+            
+            # Add the route to our app
+            app.add_api_route(
+                path=path,
+                endpoint=route_handler,
+                methods=[method.upper()],
+                summary=operation.get("summary", ""),
+                description=operation.get("description", ""),
+                tags=operation.get("tags", [])
+            )
+
+# MCP Endpoints
+@app.get("/mcp", include_in_schema=False)
+async def mcp_base_endpoint():
+    return JSONResponse(content={
+        "type": "mcp:server",
+        "version": "1.0.0",
+        "name": "FastAPI MCP Proxy",
+        "description": "MCP proxy for a remote FastAPI server",
+        "publisher": "api-proxy",
+        "endpoints": {
+            "sse": "/mcp/sse",
+            "stdio": "/mcp/stdio"
+        }
+    })
+
+# SSE endpoint for MCP
+@app.get("/mcp/sse", include_in_schema=False)
+async def mcp_sse_endpoint(request: Request):
+    # Create SSE response headers
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+    
+    # Create SSE streaming response
+    async def event_generator():
+        # Send server info
+        tools = await create_mcp_tools()
+        server_info = {
+            "type": "server_info",
+            "name": "FastAPI MCP Proxy",
+            "description": "MCP proxy for a remote FastAPI server",
+            "tools": tools
+        }
+        yield f"event: server_info\ndata: {json.dumps(server_info)}\n\n"
         
-    # Return response from original API
-    return StreamingResponse(
-        content=response.aiter_bytes(),
-        status_code=response.status_code,
-        headers=dict(response.headers)
-    )
+        # Keep the connection alive
+        while True:
+            await asyncio.sleep(30)
+            yield f"event: ping\ndata: {{}}\n\n"
+    
+    return StreamingResponse(event_generator(), headers=headers)
+
+# STDIO endpoint for MCP
+@app.post("/mcp/stdio", include_in_schema=False)
+async def mcp_stdio_endpoint(request: Request):
+    body = await request.json()
+    
+    # Parse request type and handle accordingly
+    if body.get("type") == "server_info_request":
+        tools = await create_mcp_tools()
+        return JSONResponse(content={
+            "type": "server_info",
+            "name": "FastAPI MCP Proxy",
+            "description": "MCP proxy for a remote FastAPI server",
+            "tools": tools
+        })
+    elif body.get("type") == "tool_call":
+        tool_call = body.get("tool_call", {})
+        tool_name = tool_call.get("name")
+        tool_params = tool_call.get("parameters", {})
+        
+        # Find the matching tool from our OpenAPI spec
+        spec = await get_openapi_spec()
+        tool_path = None
+        tool_method = None
+        
+        for path, path_item in spec.get("paths", {}).items():
+            for method, operation in path_item.items():
+                if method.lower() not in ["get", "post", "put", "delete", "patch"]:
+                    continue
+                
+                operation_id = operation.get("operationId", f"{method}_{path.replace('/', '_')}")
+                if operation_id == tool_name:
+                    tool_path = path
+                    tool_method = method
+                    break
+            
+            if tool_path:
+                break
+        
+        if not tool_path:
+            return JSONResponse(content={
+                "type": "tool_call_error",
+                "error": f"Tool '{tool_name}' not found"
+            }, status_code=404)
+        
+        # Build request to the original API
+        # Replace path parameters
+        final_path = tool_path
+        path_params = {}
+        query_params = {}
+        body_params = {}
+        
+        # Extract path parameters
+        for param in spec.get("paths", {}).get(tool_path, {}).get(tool_method, {}).get("parameters", []):
+            if param.get("in") == "path":
+                param_name = param.get("name")
+                if param_name in tool_params:
+                    path_params[param_name] = tool_params[param_name]
+                    final_path = final_path.replace(f"{{{param_name}}}", str(tool_params[param_name]))
+            elif param.get("in") == "query":
+                param_name = param.get("name")
+                if param_name in tool_params:
+                    query_params[param_name] = tool_params[param_name]
+        
+        # Handle body parameters
+        if tool_method.lower() in ["post", "put", "patch"]:
+            body_schema = spec.get("paths", {}).get(tool_path, {}).get(tool_method, {}).get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+            if body_schema:
+                for param_name in tool_params:
+                    if param_name not in path_params and param_name not in query_params:
+                        body_params[param_name] = tool_params[param_name]
+        
+        # Build query string
+        query_string = "&".join([f"{k}={v}" for k, v in query_params.items()]) if query_params else ""
+        target_url = f"{ORIGINAL_API_URL}{final_path}"
+        if query_string:
+            target_url = f"{target_url}?{query_string}"
+        
+        # Make the request to the original API
+        headers = {"Content-Type": "application/json"}
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.request(
+                    method=tool_method.upper(),
+                    url=target_url,
+                    headers=headers,
+                    json=body_params if body_params else None
+                )
+                
+                # Return the tool call result
+                try:
+                    response_data = response.json()
+                except:
+                    response_data = {"raw_content": response.text}
+                
+                return JSONResponse(content={
+                    "type": "tool_call_result",
+                    "result": response_data
+                })
+            except httpx.HTTPError as e:
+                return JSONResponse(content={
+                    "type": "tool_call_error",
+                    "error": f"API request failed: {str(e)}"
+                }, status_code=500)
+    
+    # Default response for unknown request types
+    return JSONResponse(content={
+        "type": "error",
+        "error": "Unknown request type"
+    }, status_code=400)
+
+# Import asyncio for the SSE generator
+import asyncio
+from fastapi.responses import StreamingResponse
