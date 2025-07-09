@@ -2412,3 +2412,469 @@ This completes the implementation of all the files in the proposed MCP Hub Regis
 6. **Error Handling** - Comprehensive exception hierarchy
 
 The hub can now function as both a registry for discovering MCP servers and a runtime environment for hosting them dynamically.
+
+
+
+*Thinking...*
+
+> The user is asking if FastMCP's OpenAPI integration (from the URL content) can make the MCP Hub Registry implementation easier. Looking at the documentation, FastMCP can automatically generate MCP servers from OpenAPI specifications using `FastMCP.from_openapi()`.
+> 
+> This would significantly simplify the implementation, especially in the `loaders/openapi.py` file. Let me identify what files need changes and how to make them consistent with FastMCP's OpenAPI integration features.
+> 
+> Key features from FastMCP OpenAPI integration:
+> 1. `FastMCP.from_openapi()` class method
+> 2. Route mapping with `RouteMap` and `MCPType`
+> 3. Authentication via HTTP client configuration
+> 4. Component name customization with `mcp_names`
+> 5. Tag support (global and per-route)
+> 6. Advanced customization with `mcp_component_fn`
+> 7. `route_map_fn` for advanced routing logic
+> 
+> Files that need changes:
+> 1. `loaders/openapi.py` - Major simplification
+> 2. `models/registry.py` - Update to store FastMCP-specific config
+> 3. `models/server.py` - Update OpenAPIConfig to match FastMCP parameters
+> 4. `core/hub.py` - Minor updates to handle the simplified loader
+> 
+> Let me provide the updated implementations.
+
+Yes, FastMCP's OpenAPI integration will significantly simplify the implementation! Here are the files that need changes to leverage FastMCP's built-in OpenAPI features:
+
+## Files to Update
+
+### 1. **loaders/openapi.py** (Major Simplification)
+
+```python
+import asyncio
+import httpx
+from typing import Optional, List, Dict, Any
+from fastmcp import FastMCP
+from fastmcp.server.openapi import RouteMap, MCPType
+
+from .base import ServerLoader, LoadResult
+from ..models.registry import ServerEntry
+
+
+class OpenAPIServerLoader(ServerLoader):
+    """Loader for OpenAPI-based MCP servers using FastMCP"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        if not entry.openapi_config:
+            return LoadResult(
+                success=False,
+                error="No OpenAPI configuration provided"
+            )
+        
+        try:
+            # Create HTTP client with authentication
+            client = self._create_http_client(entry)
+            
+            # Fetch OpenAPI spec
+            openapi_url = entry.openapi_config.get("url")
+            if not openapi_url:
+                raise ValueError("OpenAPI URL not provided")
+            
+            async with asyncio.timeout(30.0):
+                response = await client.get(openapi_url)
+                response.raise_for_status()
+                openapi_spec = response.json()
+            
+            # Build FastMCP.from_openapi() parameters
+            kwargs = {
+                "openapi_spec": openapi_spec,
+                "client": client,
+                "name": entry.name,
+            }
+            
+            # Add optional parameters if provided
+            if entry.openapi_config.get("route_maps"):
+                kwargs["route_maps"] = self._build_route_maps(entry.openapi_config["route_maps"])
+            
+            if entry.openapi_config.get("route_map_fn"):
+                kwargs["route_map_fn"] = self._create_route_map_fn(entry.openapi_config["route_map_fn"])
+            
+            if entry.openapi_config.get("mcp_names"):
+                kwargs["mcp_names"] = entry.openapi_config["mcp_names"]
+            
+            if entry.tags:
+                kwargs["tags"] = set(entry.tags)
+            
+            if entry.openapi_config.get("mcp_component_fn"):
+                kwargs["mcp_component_fn"] = self._create_component_fn(entry.openapi_config["mcp_component_fn"])
+            
+            if entry.openapi_config.get("timeout"):
+                kwargs["timeout"] = entry.openapi_config["timeout"]
+            
+            # Create MCP server using FastMCP's from_openapi
+            mcp = await FastMCP.from_openapi(**kwargs)
+            
+            # Get ASGI app
+            app = mcp.http_app(path="/mcp")
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=mcp,
+                app=app
+            )
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load OpenAPI server: {str(e)}"
+            )
+        finally:
+            if hasattr(self, '_client'):
+                await self._client.aclose()
+    
+    def _create_http_client(self, entry: ServerEntry) -> httpx.AsyncClient:
+        """Create HTTP client with authentication"""
+        headers = {}
+        auth = None
+        
+        if entry.auth_config:
+            auth_type = entry.auth_config.get("type")
+            
+            if auth_type == "bearer":
+                token = entry.auth_config.get("token")
+                headers["Authorization"] = f"Bearer {token}"
+            elif auth_type == "api_key":
+                key_name = entry.auth_config.get("header_name", "X-API-Key")
+                key_value = entry.auth_config.get("api_key")
+                headers[key_name] = key_value
+            elif auth_type == "basic":
+                username = entry.auth_config.get("username")
+                password = entry.auth_config.get("password")
+                auth = httpx.BasicAuth(username, password)
+        
+        base_url = entry.openapi_config.get("base_url", "")
+        
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            auth=auth,
+            timeout=entry.openapi_config.get("timeout", 30.0)
+        )
+        
+        return self._client
+    
+    def _build_route_maps(self, route_map_configs: List[Dict[str, Any]]) -> List[RouteMap]:
+        """Convert configuration dicts to RouteMap objects"""
+        route_maps = []
+        
+        for config in route_map_configs:
+            route_map = RouteMap(
+                methods=config.get("methods", ["*"]),
+                pattern=config.get("pattern", r".*"),
+                tags=set(config.get("tags", [])),
+                mcp_type=MCPType[config.get("mcp_type", "TOOL")],
+                mcp_tags=set(config.get("mcp_tags", []))
+            )
+            route_maps.append(route_map)
+        
+        return route_maps
+    
+    def _create_route_map_fn(self, config: Dict[str, Any]):
+        """Create route_map_fn from configuration"""
+        rules = config.get("rules", [])
+        
+        def route_map_fn(route, mcp_type):
+            for rule in rules:
+                # Check path contains
+                if rule.get("path_contains") and rule["path_contains"] in route.path:
+                    return MCPType[rule.get("mcp_type", "TOOL")]
+                
+                # Check path starts with
+                if rule.get("path_starts_with") and route.path.startswith(rule["path_starts_with"]):
+                    return MCPType[rule.get("mcp_type", "TOOL")]
+                
+                # Check method
+                if rule.get("method") and route.method == rule["method"]:
+                    return MCPType[rule.get("mcp_type", "TOOL")]
+                
+                # Check tags
+                if rule.get("has_tag") and rule["has_tag"] in route.tags:
+                    return MCPType[rule.get("mcp_type", "EXCLUDE")]
+            
+            return None
+        
+        return route_map_fn
+    
+    def _create_component_fn(self, config: Dict[str, Any]):
+        """Create mcp_component_fn from configuration"""
+        add_tags = set(config.get("add_tags", []))
+        prefix_tools = config.get("prefix_tools", "")
+        prefix_resources = config.get("prefix_resources", "")
+        
+        def component_fn(route, component):
+            # Add configured tags
+            for tag in add_tags:
+                component.tags.add(tag)
+            
+            # Add prefixes to descriptions
+            if hasattr(component, '__class__'):
+                if component.__class__.__name__ == 'OpenAPITool' and prefix_tools:
+                    component.description = f"{prefix_tools} {component.description}"
+                elif component.__class__.__name__ == 'OpenAPIResource' and prefix_resources:
+                    component.description = f"{prefix_resources} {component.description}"
+        
+        return component_fn
+```
+
+### 2. **models/server.py** (Update OpenAPIConfig)
+
+```python
+from typing import Dict, List, Optional, Any
+from pydantic import BaseModel, Field
+from enum import Enum
+
+
+class RouteMapConfig(BaseModel):
+    """Configuration for FastMCP RouteMap"""
+    methods: List[str] = ["*"]
+    pattern: str = r".*"
+    tags: List[str] = []
+    mcp_type: str = "TOOL"  # TOOL, RESOURCE, RESOURCE_TEMPLATE, EXCLUDE
+    mcp_tags: List[str] = []
+
+
+class RouteMapFnRule(BaseModel):
+    """Rule for route_map_fn"""
+    path_contains: Optional[str] = None
+    path_starts_with: Optional[str] = None
+    method: Optional[str] = None
+    has_tag: Optional[str] = None
+    mcp_type: str = "TOOL"
+
+
+class ComponentFnConfig(BaseModel):
+    """Configuration for mcp_component_fn"""
+    add_tags: List[str] = []
+    prefix_tools: str = ""
+    prefix_resources: str = ""
+    suffix_templates: str = ""
+
+
+class OpenAPIConfig(BaseModel):
+    """OpenAPI configuration aligned with FastMCP.from_openapi()"""
+    url: str
+    base_url: Optional[str] = None
+    timeout: float = 30.0
+    
+    # FastMCP.from_openapi() parameters
+    route_maps: Optional[List[RouteMapConfig]] = None
+    route_map_fn: Optional[Dict[str, Any]] = None  # Contains rules
+    mcp_names: Dict[str, str] = Field(default_factory=dict)
+    mcp_component_fn: Optional[ComponentFnConfig] = None
+    
+    # Legacy fields for backward compatibility
+    routing_rules: Optional[List[Dict[str, Any]]] = None
+    advanced_routing: Optional[bool] = None
+    customize_components: Optional[bool] = None
+```
+
+### 3. **models/registry.py** (Add FastMCP-specific fields)
+
+```python
+# Add to ServerEntry model
+class ServerEntry(BaseModel):
+    # ... existing fields ...
+    
+    # FastMCP OpenAPI specific configuration
+    fastmcp_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="FastMCP-specific configuration for from_openapi()"
+    )
+    
+    # Simplified route maps for UI/API
+    route_maps: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Route mapping configuration for FastMCP"
+    )
+```
+
+### 4. **Example Configuration Update**
+
+Update the configuration examples to use FastMCP features:
+
+```yaml
+servers:
+  - id: "github-api"
+    name: "GitHub API Server"
+    description: "MCP server for GitHub API"
+    openapi_config:
+      url: "https://api.github.com/openapi.json"
+      base_url: "https://api.github.com"
+      
+      # FastMCP route mapping
+      route_maps:
+        - methods: ["GET"]
+          pattern: "^/repos/.*"
+          mcp_type: "RESOURCE_TEMPLATE"
+          mcp_tags: ["repository", "read-only"]
+        
+        - methods: ["POST", "PUT", "PATCH"]
+          pattern: ".*"
+          mcp_type: "TOOL"
+          mcp_tags: ["write-operation"]
+        
+        - pattern: "^/admin/.*"
+          mcp_type: "EXCLUDE"
+      
+      # Custom component names
+      mcp_names:
+        "repos_get": "get_repository"
+        "repos_create": "create_repository"
+        "issues_list": "list_issues"
+      
+      # Component customization
+      mcp_component_fn:
+        add_tags: ["github", "api-v3"]
+        prefix_tools: "🔧"
+        prefix_resources: "📊"
+    
+    auth_config:
+      type: "bearer"
+      token: "${GITHUB_TOKEN}"
+    
+    tags: ["vcs", "collaboration", "external"]
+```
+
+### 5. **Simplified Docker Compose for Testing**
+
+```yaml
+version: '3.8'
+
+services:
+  hub:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - MCP_REGISTRY_DATABASE_URL=mongodb://mongo:27017
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+    depends_on:
+      - mongo
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    command: python -m mcp_hub_registry run -c /app/config.yaml
+
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
+```
+
+### 6. **Add FastMCP-specific CLI Commands**
+
+Update `cli.py` to add commands for testing OpenAPI conversion:
+
+```python
+@cli.command()
+@click.argument('openapi_url')
+@click.option('--output', '-o', help='Output file for server configuration')
+@click.option('--test', is_flag=True, help='Test the OpenAPI conversion')
+def analyze_openapi(openapi_url: str, output: Optional[str], test: bool):
+    """Analyze an OpenAPI spec and generate MCP server configuration"""
+    
+    async def analyze():
+        import httpx
+        from fastmcp import FastMCP
+        
+        # Fetch OpenAPI spec
+        async with httpx.AsyncClient() as client:
+            response = await client.get(openapi_url)
+            response.raise_for_status()
+            spec = response.json()
+        
+        if test:
+            # Test conversion
+            mcp = await FastMCP.from_openapi(
+                openapi_spec=spec,
+                client=httpx.AsyncClient(),
+                name="test_server"
+            )
+            
+            click.echo(f"Successfully converted OpenAPI to MCP server")
+            click.echo(f"Tools: {len(mcp.list_tools())}")
+            click.echo(f"Resources: {len(mcp.list_resources())}")
+            click.echo(f"Prompts: {len(mcp.list_prompts())}")
+            
+            # Show first few tools
+            for tool in list(mcp.list_tools())[:5]:
+                click.echo(f"  - {tool.name}: {tool.description[:50]}...")
+        
+        # Generate configuration
+        config = {
+            "id": spec.get("info", {}).get("title", "").lower().replace(" ", "-"),
+            "name": spec.get("info", {}).get("title", "API Server"),
+            "description": spec.get("info", {}).get("description", ""),
+            "openapi_config": {
+                "url": openapi_url,
+                "route_maps": [
+                    {
+                        "methods": ["GET"],
+                        "pattern": r".*\{.*\}.*",
+                        "mcp_type": "RESOURCE_TEMPLATE"
+                    },
+                    {
+                        "methods": ["GET"],
+                        "mcp_type": "RESOURCE"
+                    }
+                ]
+            }
+        }
+        
+        if output:
+            with open(output, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+            click.echo(f"Configuration saved to {output}")
+        else:
+            click.echo(yaml.dump(config, default_flow_style=False))
+    
+    asyncio.run(analyze())
+```
+
+## Benefits of Using FastMCP's OpenAPI Integration
+
+1. **Simplified Code**: The OpenAPI loader is now much simpler, leveraging FastMCP's built-in functionality
+2. **Better Route Mapping**: Direct support for RouteMap and MCPType enums
+3. **Component Customization**: Built-in support for mcp_component_fn and mcp_names
+4. **Automatic Parameter Handling**: FastMCP handles query, path, and header parameters correctly
+5. **Tag Management**: Native support for global and per-route tags
+6. **Consistent with FastMCP**: Using the official integration ensures compatibility with future updates
+
+## Migration Path
+
+For existing configurations, add a migration utility:
+
+```python
+def migrate_openapi_config(old_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate old OpenAPI config to FastMCP format"""
+    new_config = {
+        "url": old_config.get("openapi_url"),
+        "base_url": old_config.get("base_url"),
+        "timeout": old_config.get("timeout", 30.0)
+    }
+    
+    # Convert old routing rules to route_maps
+    if old_config.get("routing_rules"):
+        route_maps = []
+        for rule in old_config["routing_rules"]:
+            route_map = {
+                "pattern": rule.get("pattern", r".*"),
+                "mcp_type": rule.get("type", "TOOL")
+            }
+            if rule.get("methods"):
+                route_map["methods"] = rule["methods"]
+            route_maps.append(route_map)
+        new_config["route_maps"] = route_maps
+    
+    return new_config
+```
+
+This integration with FastMCP's OpenAPI features makes the implementation cleaner, more maintainable, and fully compatible with FastMCP's ecosystem.
