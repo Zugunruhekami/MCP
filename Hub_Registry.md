@@ -626,3 +626,1789 @@ This design provides a production-ready MCP Hub that can:
 3. Handle failures gracefully
 4. Scale horizontally with database backend
 5. Support community contributions through the publish API
+
+
+
+
+
+*Thinking...*
+
+> The user wants me to implement the remaining files from the proposed repository structure that weren't implemented above. Let me check what was already implemented and what's missing:
+> 
+> Already implemented:
+> - models/registry.py
+> - loaders/openapi.py 
+> - core/hub.py
+> 
+> Missing files that need to be implemented:
+> - models/__init__.py
+> - models/server.py
+> - loaders/__init__.py
+> - loaders/base.py
+> - loaders/module.py
+> - loaders/package.py
+> - database/__init__.py
+> - database/interface.py
+> - database/mongodb.py
+> - database/memory.py
+> - api/__init__.py
+> - api/registry.py
+> - api/health.py
+> - api/auth.py
+> - core/__init__.py
+> - core/config.py
+> - core/exceptions.py
+> - cli.py
+> - __init__.py (root)
+> 
+> Let me implement all these missing files.
+
+Here are the remaining files for the MCP Hub Registry implementation:
+
+## Root Files
+
+**__init__.py** (root):
+```python
+from .core.hub import MCPHubRegistry
+from .core.config import Config
+from .models.registry import ServerEntry
+
+__version__ = "1.0.0"
+__all__ = ["MCPHubRegistry", "Config", "ServerEntry"]
+```
+
+**cli.py**:
+```python
+import asyncio
+import click
+import yaml
+import json
+from pathlib import Path
+from typing import Optional
+
+from mcp_hub_registry import MCPHubRegistry, Config
+from mcp_hub_registry.database import get_database
+
+
+@click.group()
+@click.option('--config', '-c', type=click.Path(exists=True), help='Configuration file path')
+@click.pass_context
+def cli(ctx, config: Optional[str]):
+    """MCP Hub Registry CLI"""
+    ctx.ensure_object(dict)
+    
+    if config:
+        ctx.obj['config'] = Config.from_file(config)
+    else:
+        # Try to find config file
+        for name in ['config.yaml', 'config.yml', 'config.toml']:
+            if Path(name).exists():
+                ctx.obj['config'] = Config.from_file(name)
+                break
+        else:
+            ctx.obj['config'] = Config()
+
+
+@cli.command()
+@click.pass_context
+def run(ctx):
+    """Run the MCP Hub Registry server"""
+    config = ctx.obj.get('config')
+    
+    async def start_server():
+        import uvicorn
+        from mcp_hub_registry.database import get_database
+        
+        # Create database connection
+        db = get_database(config.database)
+        await db.connect()
+        
+        # Create hub
+        hub = MCPHubRegistry(db, config.dict())
+        app = await hub.create_app()
+        
+        # Run server
+        server_config = uvicorn.Config(
+            app=app,
+            host=config.api.host,
+            port=config.api.port,
+            log_level=config.api.log_level
+        )
+        server = uvicorn.Server(server_config)
+        await server.serve()
+    
+    asyncio.run(start_server())
+
+
+@cli.command()
+@click.argument('server_id')
+@click.pass_context
+def info(ctx, server_id: str):
+    """Get information about a server"""
+    config = ctx.obj.get('config')
+    
+    async def get_info():
+        db = get_database(config.database)
+        await db.connect()
+        
+        entry = await db.get_entry(server_id)
+        if entry:
+            click.echo(yaml.dump(entry.dict(), default_flow_style=False))
+        else:
+            click.echo(f"Server '{server_id}' not found")
+        
+        await db.close()
+    
+    asyncio.run(get_info())
+
+
+@cli.command()
+@click.option('--enabled-only/--all', default=True, help='Show only enabled servers')
+@click.option('--format', type=click.Choice(['table', 'json', 'yaml']), default='table')
+@click.pass_context
+def list(ctx, enabled_only: bool, format: str):
+    """List all servers in the registry"""
+    config = ctx.obj.get('config')
+    
+    async def list_servers():
+        db = get_database(config.database)
+        await db.connect()
+        
+        entries = await db.list_entries(enabled_only=enabled_only)
+        
+        if format == 'table':
+            click.echo(f"{'ID':<40} {'Name':<30} {'Status':<10} {'Enabled':<8}")
+            click.echo("-" * 90)
+            for entry in entries:
+                status = await db.get_status(entry.id)
+                click.echo(f"{entry.id:<40} {entry.name:<30} {status:<10} {str(entry.enabled):<8}")
+        elif format == 'json':
+            data = [entry.dict() for entry in entries]
+            click.echo(json.dumps(data, indent=2, default=str))
+        elif format == 'yaml':
+            data = [entry.dict() for entry in entries]
+            click.echo(yaml.dump(data, default_flow_style=False))
+        
+        await db.close()
+    
+    asyncio.run(list_servers())
+
+
+@cli.command()
+@click.argument('file_path', type=click.Path(exists=True))
+@click.option('--replace/--no-replace', default=False, help='Replace existing entries')
+@click.pass_context
+def import_seed(ctx, file_path: str, replace: bool):
+    """Import seed data from a JSON file"""
+    config = ctx.obj.get('config')
+    
+    async def import_data():
+        db = get_database(config.database)
+        await db.connect()
+        
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        count = 0
+        for server_data in data.get('servers', []):
+            try:
+                entry = ServerEntry(**server_data)
+                
+                if replace or not await db.get_entry(entry.id):
+                    await db.create_entry(entry)
+                    count += 1
+                    click.echo(f"Imported: {entry.name}")
+                else:
+                    click.echo(f"Skipped (already exists): {entry.name}")
+                    
+            except Exception as e:
+                click.echo(f"Error importing server: {e}", err=True)
+        
+        click.echo(f"\nImported {count} servers")
+        await db.close()
+    
+    asyncio.run(import_data())
+
+
+@cli.command()
+@click.argument('server_id')
+@click.option('--enable/--disable', default=True)
+@click.pass_context
+def toggle(ctx, server_id: str, enable: bool):
+    """Enable or disable a server"""
+    config = ctx.obj.get('config')
+    
+    async def toggle_server():
+        db = get_database(config.database)
+        await db.connect()
+        
+        entry = await db.get_entry(server_id)
+        if entry:
+            entry.enabled = enable
+            await db.update_entry(server_id, entry)
+            click.echo(f"Server '{server_id}' {'enabled' if enable else 'disabled'}")
+        else:
+            click.echo(f"Server '{server_id}' not found")
+        
+        await db.close()
+    
+    asyncio.run(toggle_server())
+
+
+if __name__ == '__main__':
+    cli()
+```
+
+## Models
+
+**models/__init__.py**:
+```python
+from .registry import (
+    PackageArgument,
+    EnvironmentVariable,
+    Package,
+    Repository,
+    VersionDetail,
+    ServerEntry,
+    ServerStatus
+)
+from .server import (
+    ServerConfig,
+    LoaderType,
+    AuthConfig,
+    OpenAPIConfig,
+    RouteMapConfig
+)
+
+__all__ = [
+    "PackageArgument",
+    "EnvironmentVariable", 
+    "Package",
+    "Repository",
+    "VersionDetail",
+    "ServerEntry",
+    "ServerStatus",
+    "ServerConfig",
+    "LoaderType",
+    "AuthConfig",
+    "OpenAPIConfig",
+    "RouteMapConfig"
+]
+```
+
+**models/server.py**:
+```python
+from typing import Dict, List, Optional, Any
+from pydantic import BaseModel, Field
+from enum import Enum
+
+
+class LoaderType(str, Enum):
+    OPENAPI = "openapi"
+    MODULE = "module"
+    NPM = "npm"
+    DOCKER = "docker"
+    PYPI = "pypi"
+    PROXY = "proxy"
+
+
+class AuthConfig(BaseModel):
+    type: str  # bearer, api_key, basic, oauth2
+    token: Optional[str] = None
+    api_key: Optional[str] = None
+    header_name: Optional[str] = "X-API-Key"
+    username: Optional[str] = None
+    password: Optional[str] = None
+    oauth2_config: Optional[Dict[str, Any]] = None
+
+
+class RouteMapConfig(BaseModel):
+    methods: List[str] = ["*"]
+    pattern: str = r".*"
+    tags: List[str] = []
+    mcp_type: str = "TOOL"  # TOOL, RESOURCE, RESOURCE_TEMPLATE, EXCLUDE
+    mcp_tags: List[str] = []
+
+
+class OpenAPIConfig(BaseModel):
+    url: str
+    base_url: Optional[str] = None
+    timeout: float = 30.0
+    mcp_names: Dict[str, str] = Field(default_factory=dict)
+    routing_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    advanced_routing: bool = False
+    customize_components: bool = False
+
+
+class ServerConfig(BaseModel):
+    """Unified server configuration model"""
+    id: str
+    name: str
+    description: str
+    loader_type: LoaderType
+    enabled: bool = True
+    
+    # Loader-specific configurations
+    openapi_config: Optional[OpenAPIConfig] = None
+    module_config: Optional[Dict[str, Any]] = None
+    package_config: Optional[Dict[str, Any]] = None
+    proxy_config: Optional[Dict[str, Any]] = None
+    
+    # Common configurations
+    auth_config: Optional[AuthConfig] = None
+    route_maps: List[RouteMapConfig] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    mount_path: Optional[str] = None
+    
+    # Retry configuration
+    retry_attempts: int = 3
+    retry_delay: float = 2.0
+    
+    # Health check configuration
+    health_check_enabled: bool = True
+    health_check_interval: int = 60  # seconds
+    health_check_timeout: float = 5.0
+```
+
+## Loaders
+
+**loaders/__init__.py**:
+```python
+from typing import Dict, Type
+from .base import ServerLoader, LoadResult
+from .openapi import OpenAPIServerLoader
+from .module import ModuleServerLoader
+from .package import NPMServerLoader, DockerServerLoader, PyPIServerLoader
+
+# Registry of available loaders
+_LOADERS: Dict[str, Type[ServerLoader]] = {
+    "openapi": OpenAPIServerLoader,
+    "module": ModuleServerLoader,
+    "npm": NPMServerLoader,
+    "docker": DockerServerLoader,
+    "pypi": PyPIServerLoader,
+}
+
+
+def get_loader(loader_type: str) -> ServerLoader:
+    """Get a server loader instance by type"""
+    loader_class = _LOADERS.get(loader_type)
+    if not loader_class:
+        raise ValueError(f"Unknown loader type: {loader_type}")
+    return loader_class()
+
+
+def register_loader(loader_type: str, loader_class: Type[ServerLoader]):
+    """Register a custom loader"""
+    _LOADERS[loader_type] = loader_class
+
+
+__all__ = [
+    "ServerLoader",
+    "LoadResult",
+    "get_loader",
+    "register_loader",
+    "OpenAPIServerLoader",
+    "ModuleServerLoader",
+    "NPMServerLoader",
+    "DockerServerLoader",
+    "PyPIServerLoader"
+]
+```
+
+**loaders/base.py**:
+```python
+from abc import ABC, abstractmethod
+from typing import Optional
+from dataclasses import dataclass
+
+from fastmcp import FastMCP
+from starlette.applications import Starlette
+
+from ..models.registry import ServerEntry
+
+
+@dataclass
+class LoadResult:
+    """Result of loading a server"""
+    success: bool
+    error: Optional[str] = None
+    mcp_instance: Optional[FastMCP] = None
+    app: Optional[Starlette] = None
+
+
+class ServerLoader(ABC):
+    """Abstract base class for server loaders"""
+    
+    @abstractmethod
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        """Load a server from the given entry"""
+        pass
+    
+    def create_error_app(self, server_name: str, error: str) -> Starlette:
+        """Create a fallback error app"""
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+        
+        async def error_endpoint(request):
+            return JSONResponse({
+                "error": "Server unavailable",
+                "server": server_name,
+                "message": error,
+                "status": "failed"
+            }, status_code=503)
+        
+        return Starlette(routes=[
+            Route("/{path:path}", endpoint=error_endpoint, methods=["GET", "POST", "PUT", "DELETE"])
+        ])
+```
+
+**loaders/module.py**:
+```python
+import importlib
+import asyncio
+from typing import Optional
+from fastmcp import FastMCP
+
+from .base import ServerLoader, LoadResult
+from ..models.registry import ServerEntry
+
+
+class ModuleServerLoader(ServerLoader):
+    """Loader for Python module-based MCP servers"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        # Check if this server has a Python package
+        python_package = None
+        for package in entry.packages:
+            if package.registry_name == "pypi":
+                python_package = package
+                break
+        
+        if not python_package:
+            return LoadResult(
+                success=False,
+                error="No Python package configuration found"
+            )
+        
+        try:
+            # Extract module path and factory function
+            module_path = None
+            factory_function = "create_server"  # default
+            
+            # Look for module path in package arguments
+            for arg in python_package.package_arguments:
+                if arg.description.lower().contains("module"):
+                    module_path = arg.value or arg.default
+                elif arg.description.lower().contains("factory"):
+                    factory_function = arg.value or arg.default
+            
+            if not module_path:
+                # Try to derive from package name
+                module_path = python_package.name.replace("-", "_")
+            
+            # Import the module
+            module = importlib.import_module(module_path)
+            
+            # Get the factory function
+            if not hasattr(module, factory_function):
+                # Try common factory function names
+                for name in ["create_server", "create_mcp_server", "get_server", "main"]:
+                    if hasattr(module, name):
+                        factory_function = name
+                        break
+                else:
+                    raise AttributeError(f"No factory function found in {module_path}")
+            
+            factory = getattr(module, factory_function)
+            
+            # Call the factory function
+            if asyncio.iscoroutinefunction(factory):
+                mcp = await factory()
+            else:
+                mcp = factory()
+            
+            if not isinstance(mcp, FastMCP):
+                raise TypeError(f"Factory function must return FastMCP instance, got {type(mcp)}")
+            
+            # Get ASGI app
+            app = mcp.http_app(path="/mcp")
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=mcp,
+                app=app
+            )
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load module server: {str(e)}"
+            )
+```
+
+**loaders/package.py**:
+```python
+import asyncio
+import subprocess
+import tempfile
+import json
+from typing import Optional, Dict, Any
+from pathlib import Path
+
+from fastmcp import FastMCP, Client
+from fastmcp.client import StdioTransport, SSETransport
+
+from .base import ServerLoader, LoadResult
+from ..models.registry import ServerEntry, Package
+
+
+class NPMServerLoader(ServerLoader):
+    """Loader for NPM-based MCP servers"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        npm_package = self._get_package(entry, "npm")
+        if not npm_package:
+            return LoadResult(success=False, error="No NPM package configuration found")
+        
+        try:
+            # Install the package if needed
+            package_name = f"{npm_package.name}@{npm_package.version}"
+            
+            # Create a temporary directory for the server
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Install the package
+                install_result = await self._run_command(
+                    ["npm", "install", package_name],
+                    cwd=tmpdir
+                )
+                
+                if install_result.returncode != 0:
+                    raise Exception(f"Failed to install package: {install_result.stderr}")
+                
+                # Build the command to run the server
+                cmd = ["npx", npm_package.name]
+                
+                # Add package arguments
+                for arg in npm_package.package_arguments:
+                    if arg.value:
+                        cmd.append(arg.value)
+                
+                # Set environment variables
+                env = {}
+                for env_var in npm_package.environment_variables:
+                    if env_var.default:
+                        env[env_var.name] = env_var.default
+                
+                # Create MCP client with stdio transport
+                client = Client(f"{entry.name}_client")
+                transport = StdioTransport(cmd, env=env, cwd=tmpdir)
+                
+                # Connect the client
+                await client.connect(transport)
+                
+                # Create a proxy MCP server
+                mcp = FastMCP.as_proxy(
+                    client=client,
+                    name=entry.name
+                )
+                
+                app = mcp.http_app(path="/mcp")
+                
+                return LoadResult(
+                    success=True,
+                    mcp_instance=mcp,
+                    app=app
+                )
+                
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load NPM server: {str(e)}"
+            )
+    
+    def _get_package(self, entry: ServerEntry, registry_name: str) -> Optional[Package]:
+        for package in entry.packages:
+            if package.registry_name == registry_name:
+                return package
+        return None
+    
+    async def _run_command(self, cmd: list, cwd: str = None) -> subprocess.CompletedProcess:
+        """Run a command asynchronously"""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode,
+            stdout=stdout.decode() if stdout else "",
+            stderr=stderr.decode() if stderr else ""
+        )
+
+
+class DockerServerLoader(ServerLoader):
+    """Loader for Docker-based MCP servers"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        docker_package = self._get_package(entry, "docker")
+        if not docker_package:
+            return LoadResult(success=False, error="No Docker package configuration found")
+        
+        try:
+            import aiodocker
+            
+            # Create Docker client
+            docker = aiodocker.Docker()
+            
+            # Pull the image if needed
+            image_name = docker_package.name
+            if docker_package.version and docker_package.version != "latest":
+                image_name = f"{image_name}:{docker_package.version}"
+            
+            # Check if image exists
+            try:
+                await docker.images.inspect(image_name)
+            except aiodocker.DockerError:
+                # Pull the image
+                await docker.images.pull(image_name)
+            
+            # Build container configuration
+            config = {
+                "Image": image_name,
+                "Env": [f"{ev.name}={ev.default}" for ev in docker_package.environment_variables if ev.default],
+                "HostConfig": {
+                    "AutoRemove": True,
+                    "NetworkMode": "bridge"
+                }
+            }
+            
+            # Add runtime arguments
+            if docker_package.runtime_arguments:
+                config["Cmd"] = [arg.value for arg in docker_package.runtime_arguments if arg.value]
+            
+            # Create and start container
+            container = await docker.containers.create(config=config, name=f"mcp-{entry.id}")
+            await container.start()
+            
+            # Get container info
+            info = await container.show()
+            container_ip = info['NetworkSettings']['IPAddress']
+            
+            # Create MCP client to connect to the container
+            # Assuming the container exposes MCP on a known port (e.g., 8080)
+            client = Client(f"{entry.name}_client")
+            
+            # Use HTTP/SSE transport to connect to the container
+            transport = SSETransport(f"http://{container_ip}:8080/sse")
+            await client.connect(transport)
+            
+            # Create proxy MCP server
+            mcp = FastMCP.as_proxy(
+                client=client,
+                name=entry.name
+            )
+            
+            app = mcp.http_app(path="/mcp")
+            
+            # Store container reference for cleanup
+            app.state.container = container
+            app.state.docker = docker
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=mcp,
+                app=app
+            )
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load Docker server: {str(e)}"
+            )
+    
+    def _get_package(self, entry: ServerEntry, registry_name: str) -> Optional[Package]:
+        for package in entry.packages:
+            if package.registry_name == registry_name:
+                return package
+        return None
+
+
+class PyPIServerLoader(ServerLoader):
+    """Loader for PyPI-based MCP servers"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        pypi_package = self._get_package(entry, "pypi")
+        if not pypi_package:
+            return LoadResult(success=False, error="No PyPI package configuration found")
+        
+        try:
+            # Install the package if needed
+            package_spec = f"{pypi_package.name}=={pypi_package.version}"
+            
+            # Check if package is already installed
+            try:
+                importlib.import_module(pypi_package.name.replace("-", "_"))
+            except ImportError:
+                # Install the package
+                install_result = await self._run_command(
+                    ["pip", "install", package_spec]
+                )
+                
+                if install_result.returncode != 0:
+                    raise Exception(f"Failed to install package: {install_result.stderr}")
+            
+            # Now use the module loader
+            from .module import ModuleServerLoader
+            module_loader = ModuleServerLoader()
+            return await module_loader.load(entry)
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load PyPI server: {str(e)}"
+            )
+    
+    def _get_package(self, entry: ServerEntry, registry_name: str) -> Optional[Package]:
+        for package in entry.packages:
+            if package.registry_name == registry_name:
+                return package
+        return None
+    
+    async def _run_command(self, cmd: list) -> subprocess.CompletedProcess:
+        """Run a command asynchronously"""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode,
+            stdout=stdout.decode() if stdout else "",
+            stderr=stderr.decode() if stderr else ""
+        )
+```
+
+## Database
+
+**database/__init__.py**:
+```python
+from typing import Union
+from .interface import RegistryDatabase, DatabaseConfig
+from .mongodb import MongoDBRegistry
+from .memory import InMemoryRegistry
+
+
+def get_database(config: DatabaseConfig) -> RegistryDatabase:
+    """Factory function to create database instance based on config"""
+    if config.type == "mongodb":
+        return MongoDBRegistry(config)
+    elif config.type == "memory":
+        return InMemoryRegistry(config)
+    else:
+        raise ValueError(f"Unknown database type: {config.type}")
+
+
+__all__ = [
+    "RegistryDatabase",
+    "DatabaseConfig",
+    "MongoDBRegistry",
+    "InMemoryRegistry",
+    "get_database"
+]
+```
+
+**database/interface.py**:
+```python
+from abc import ABC, abstractmethod
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
+from pydantic import BaseModel
+
+from ..models.registry import ServerEntry, ServerStatus
+
+
+class DatabaseConfig(BaseModel):
+    """Database configuration"""
+    type: str  # mongodb, postgresql, memory
+    url: Optional[str] = None
+    database_name: str = "mcp-registry"
+    collection_name: str = "servers"
+
+
+class RegistryDatabase(ABC):
+    """Abstract base class for registry database implementations"""
+    
+    def __init__(self, config: DatabaseConfig):
+        self.config = config
+    
+    @abstractmethod
+    async def connect(self):
+        """Connect to the database"""
+        pass
+    
+    @abstractmethod
+    async def close(self):
+        """Close the database connection"""
+        pass
+    
+    @abstractmethod
+    async def create_entry(self, entry: ServerEntry) -> str:
+        """Create a new server entry"""
+        pass
+    
+    @abstractmethod
+    async def get_entry(self, server_id: str) -> Optional[ServerEntry]:
+        """Get a server entry by ID"""
+        pass
+    
+    @abstractmethod
+    async def update_entry(self, server_id: str, entry: ServerEntry) -> bool:
+        """Update a server entry"""
+        pass
+    
+    @abstractmethod
+    async def delete_entry(self, server_id: str) -> bool:
+        """Delete a server entry"""
+        pass
+    
+    @abstractmethod
+    async def list_entries(
+        self,
+        enabled_only: bool = False,
+        tags: Optional[List[str]] = None
+    ) -> List[ServerEntry]:
+        """List all server entries"""
+        pass
+    
+    @abstractmethod
+    async def list_entries_paginated(
+        self,
+        limit: int = 30,
+        cursor: Optional[str] = None,
+        enabled_only: bool = False
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """List server entries with pagination"""
+        pass
+    
+    @abstractmethod
+    async def update_status(
+        self,
+        server_id: str,
+        status: ServerStatus,
+        error: Optional[str] = None
+    ):
+        """Update server runtime status"""
+        pass
+    
+    @abstractmethod
+    async def get_status(self, server_id: str) -> Optional[str]:
+        """Get server runtime status"""
+        pass
+    
+    @abstractmethod
+    async def search_entries(
+        self,
+        query: str,
+        fields: List[str] = None
+    ) -> List[ServerEntry]:
+        """Search server entries"""
+        pass
+```
+
+**database/mongodb.py**:
+```python
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
+import motor.motor_asyncio
+from bson import ObjectId
+
+from .interface import RegistryDatabase, DatabaseConfig
+from ..models.registry import ServerEntry, ServerStatus
+
+
+class MongoDBRegistry(RegistryDatabase):
+    """MongoDB implementation of registry database"""
+    
+    def __init__(self, config: DatabaseConfig):
+        super().__init__(config)
+        self.client = None
+        self.db = None
+        self.collection = None
+        self.status_collection = None
+    
+    async def connect(self):
+        """Connect to MongoDB"""
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(self.config.url)
+        self.db = self.client[self.config.database_name]
+        self.collection = self.db[self.config.collection_name]
+        self.status_collection = self.db[f"{self.config.collection_name}_status"]
+        
+        # Create indexes
+        await self.collection.create_index("id", unique=True)
+        await self.collection.create_index("name")
+        await self.collection.create_index("tags")
+        await self.collection.create_index("enabled")
+        await self.status_collection.create_index("server_id", unique=True)
+    
+    async def close(self):
+        """Close MongoDB connection"""
+        if self.client:
+            self.client.close()
+    
+    async def create_entry(self, entry: ServerEntry) -> str:
+        """Create a new server entry"""
+        doc = entry.dict()
+        doc["_id"] = ObjectId()
+        doc["created_at"] = datetime.utcnow()
+        doc["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.insert_one(doc)
+        return entry.id
+    
+    async def get_entry(self, server_id: str) -> Optional[ServerEntry]:
+        """Get a server entry by ID"""
+        doc = await self.collection.find_one({"id": server_id})
+        if doc:
+            doc.pop("_id", None)
+            return ServerEntry(**doc)
+        return None
+    
+    async def update_entry(self, server_id: str, entry: ServerEntry) -> bool:
+        """Update a server entry"""
+        doc = entry.dict()
+        doc["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"id": server_id},
+            {"$set": doc}
+        )
+        return result.modified_count > 0
+    
+    async def delete_entry(self, server_id: str) -> bool:
+        """Delete a server entry"""
+        result = await self.collection.delete_one({"id": server_id})
+        await self.status_collection.delete_one({"server_id": server_id})
+        return result.deleted_count > 0
+    
+    async def list_entries(
+        self,
+        enabled_only: bool = False,
+        tags: Optional[List[str]] = None
+    ) -> List[ServerEntry]:
+        """List all server entries"""
+        query = {}
+        
+        if enabled_only:
+            query["enabled"] = True
+        
+        if tags:
+            query["tags"] = {"$in": tags}
+        
+        cursor = self.collection.find(query)
+        entries = []
+        
+        async for doc in cursor:
+            doc.pop("_id", None)
+            entries.append(ServerEntry(**doc))
+        
+        return entries
+    
+    async def list_entries_paginated(
+        self,
+        limit: int = 30,
+        cursor: Optional[str] = None,
+        enabled_only: bool = False
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """List server entries with pagination"""
+        query = {}
+        
+        if enabled_only:
+            query["enabled"] = True
+        
+        if cursor:
+            query["_id"] = {"$gt": ObjectId(cursor)}
+        
+        # Fetch one extra to determine if there's a next page
+        docs = await self.collection.find(query).limit(limit + 1).to_list(length=limit + 1)
+        
+        has_next = len(docs) > limit
+        if has_next:
+            docs = docs[:limit]
+            next_cursor = str(docs[-1]["_id"])
+        else:
+            next_cursor = None
+        
+        # Convert to dict and remove _id
+        entries = []
+        for doc in docs:
+            doc.pop("_id", None)
+            entries.append(doc)
+        
+        return entries, next_cursor
+    
+    async def update_status(
+        self,
+        server_id: str,
+        status: ServerStatus,
+        error: Optional[str] = None
+    ):
+        """Update server runtime status"""
+        await self.status_collection.update_one(
+            {"server_id": server_id},
+            {
+                "$set": {
+                    "status": status.value,
+                    "error": error,
+                    "updated_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+    
+    async def get_status(self, server_id: str) -> Optional[str]:
+        """Get server runtime status"""
+        doc = await self.status_collection.find_one({"server_id": server_id})
+        if doc:
+            return doc.get("status")
+        return None
+    
+    async def search_entries(
+        self,
+        query: str,
+        fields: List[str] = None
+    ) -> List[ServerEntry]:
+        """Search server entries"""
+        if not fields:
+            fields = ["name", "description", "tags"]
+        
+        # Build OR query for text search
+        or_conditions = []
+        for field in fields:
+            or_conditions.append({field: {"$regex": query, "$options": "i"}})
+        
+        mongo_query = {"$or": or_conditions}
+        cursor = self.collection.find(mongo_query)
+        
+        entries = []
+        async for doc in cursor:
+            doc.pop("_id", None)
+            entries.append(ServerEntry(**doc))
+        
+        return entries
+```
+
+**database/memory.py**:
+```python
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
+import asyncio
+from collections import OrderedDict
+
+from .interface import RegistryDatabase, DatabaseConfig
+from ..models.registry import ServerEntry, ServerStatus
+
+
+class InMemoryRegistry(RegistryDatabase):
+    """In-memory implementation of registry database"""
+    
+    def __init__(self, config: DatabaseConfig):
+        super().__init__(config)
+        self.entries: OrderedDict[str, ServerEntry] = OrderedDict()
+        self.status: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+    
+    async def connect(self):
+        """No-op for in-memory database"""
+        pass
+    
+    async def close(self):
+        """No-op for in-memory database"""
+        pass
+    
+    async def create_entry(self, entry: ServerEntry) -> str:
+        """Create a new server entry"""
+        async with self._lock:
+            if entry.id in self.entries:
+                raise ValueError(f"Server with ID {entry.id} already exists")
+            
+            entry.created_at = datetime.utcnow()
+            entry.updated_at = datetime.utcnow()
+            self.entries[entry.id] = entry
+            
+            return entry.id
+    
+    async def get_entry(self, server_id: str) -> Optional[ServerEntry]:
+        """Get a server entry by ID"""
+        return self.entries.get(server_id)
+    
+    async def update_entry(self, server_id: str, entry: ServerEntry) -> bool:
+        """Update a server entry"""
+        async with self._lock:
+            if server_id not in self.entries:
+                return False
+            
+            entry.updated_at = datetime.utcnow()
+            self.entries[server_id] = entry
+            return True
+    
+    async def delete_entry(self, server_id: str) -> bool:
+        """Delete a server entry"""
+        async with self._lock:
+            if server_id in self.entries:
+                del self.entries[server_id]
+                if server_id in self.status:
+                    del self.status[server_id]
+                return True
+            return False
+    
+    async def list_entries(
+        self,
+        enabled_only: bool = False,
+        tags: Optional[List[str]] = None
+    ) -> List[ServerEntry]:
+        """List all server entries"""
+        entries = []
+        
+        for entry in self.entries.values():
+            if enabled_only and not entry.enabled:
+                continue
+            
+            if tags and not any(tag in entry.tags for tag in tags):
+                continue
+            
+            entries.append(entry)
+        
+        return entries
+    
+    async def list_entries_paginated(
+        self,
+        limit: int = 30,
+        cursor: Optional[str] = None,
+        enabled_only: bool = False
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """List server entries with pagination"""
+        all_entries = await self.list_entries(enabled_only=enabled_only)
+        
+        # Find starting position
+        start_idx = 0
+        if cursor:
+            for i, entry in enumerate(all_entries):
+                if entry.id == cursor:
+                    start_idx = i + 1
+                    break
+        
+        # Get page of entries
+        page_entries = all_entries[start_idx:start_idx + limit]
+        
+        # Convert to dict
+        entries_dict = [entry.dict() for entry in page_entries]
+        
+        # Determine next cursor
+        next_cursor = None
+        if start_idx + limit < len(all_entries):
+            next_cursor = page_entries[-1].id if page_entries else None
+        
+        return entries_dict, next_cursor
+    
+    async def update_status(
+        self,
+        server_id: str,
+        status: ServerStatus,
+        error: Optional[str] = None
+    ):
+        """Update server runtime status"""
+        self.status[server_id] = {
+            "status": status.value,
+            "error": error,
+            "updated_at": datetime.utcnow()
+        }
+    
+    async def get_status(self, server_id: str) -> Optional[str]:
+        """Get server runtime status"""
+        status_info = self.status.get(server_id)
+        if status_info:
+            return status_info.get("status")
+        return None
+    
+    async def search_entries(
+        self,
+        query: str,
+        fields: List[str] = None
+    ) -> List[ServerEntry]:
+        """Search server entries"""
+        if not fields:
+            fields = ["name", "description", "tags"]
+        
+        query_lower = query.lower()
+        results = []
+        
+        for entry in self.entries.values():
+            # Search in specified fields
+            for field in fields:
+                value = getattr(entry, field, None)
+                if value:
+                    if isinstance(value, str) and query_lower in value.lower():
+                        results.append(entry)
+                        break
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str) and query_lower in item.lower():
+                                results.append(entry)
+                                break
+        
+        return results
+```
+
+## API
+
+**api/__init__.py**:
+```python
+from .registry import create_registry_routes
+from .health import create_health_routes
+from .auth import BearerTokenBackend, create_auth_middleware
+
+__all__ = [
+    "create_registry_routes",
+    "create_health_routes", 
+    "BearerTokenBackend",
+    "create_auth_middleware"
+]
+```
+
+**api/registry.py**:
+```python
+from typing import List
+from starlette.routing import Route
+from starlette.responses import JSONResponse
+from starlette.requests import Request
+
+from ..database.interface import RegistryDatabase
+from ..models.registry import ServerEntry
+
+
+def create_registry_routes(database: RegistryDatabase, hub) -> List[Route]:
+    """Create registry API routes"""
+    routes = []
+    
+    # List servers
+    async def list_servers(request: Request):
+        limit = int(request.query_params.get("limit", 30))
+        cursor = request.query_params.get("cursor")
+        
+        servers, next_cursor = await database.list_entries_paginated(
+            limit=limit,
+            cursor=cursor
+        )
+        
+        # Add runtime status from hub
+        for server in servers:
+            server_id = server["id"]
+            if server_id in hub.loaded_servers:
+                server["runtime_status"] = "healthy"
+                server["mcp_endpoint"] = f"/servers/{server_id}/mcp"
+            else:
+                status = await database.get_status(server_id)
+                server["runtime_status"] = status or "not_loaded"
+        
+        return JSONResponse({
+            "servers": servers,
+            "metadata": {
+                "next_cursor": next_cursor,
+                "count": len(servers)
+            }
+        })
+    
+    routes.append(Route("/v0/servers", endpoint=list_servers, methods=["GET"]))
+    
+    # Get server details
+    async def get_server(request: Request):
+        server_id = request.path_params["id"]
+        entry = await database.get_entry(server_id)
+        
+        if not entry:
+            return JSONResponse({"error": "Server not found"}, status_code=404)
+        
+        response = entry.dict()
+        
+        # Add runtime information
+        if server_id in hub.loaded_servers:
+            response["runtime_status"] = "healthy"
+            response["mcp_endpoint"] = f"/servers/{server_id}/mcp"
+            
+            # Get capabilities
+            server_data = hub.loaded_servers[server_id]
+            if server_data.get("mcp"):
+                mcp = server_data["mcp"]
+                try:
+                    response["capabilities"] = {
+                        "tools": [{"name": t.name, "description": t.description} 
+                                for t in mcp.list_tools()],
+                        "resources": [{"uri": r.uri, "name": r.name} 
+                                    for r in mcp.list_resources()],
+                        "prompts": [{"name": p.name, "description": p.description} 
+                                  for p in mcp.list_prompts()]
+                    }
+                except Exception:
+                    pass
+        else:
+            status = await database.get_status(server_id)
+            response["runtime_status"] = status or "not_loaded"
+        
+        return JSONResponse(response)
+    
+    routes.append(Route("/v0/servers/{id}", endpoint=get_server, methods=["GET"]))
+    
+    # Search servers
+    async def search_servers(request: Request):
+        query = request.query_params.get("q", "")
+        fields = request.query_params.getlist("fields")
+        
+        if not query:
+            return JSONResponse({"error": "Query parameter 'q' is required"}, status_code=400)
+        
+        entries = await database.search_entries(query, fields or None)
+        
+        servers = [entry.dict() for entry in entries]
+        
+        return JSONResponse({
+            "query": query,
+            "results": servers,
+            "count": len(servers)
+        })
+    
+    routes.append(Route("/v0/search", endpoint=search_servers, methods=["GET"]))
+    
+    # Publish server (requires auth)
+    async def publish_server(request: Request):
+        if not hasattr(request, "user") or not request.user.is_authenticated:
+            return JSONResponse({"error": "Authentication required"}, status_code=401)
+        
+        try:
+            data = await request.json()
+            entry = ServerEntry(**data)
+            
+            # Check if server already exists
+            existing = await database.get_entry(entry.id)
+            if existing:
+                return JSONResponse(
+                    {"error": f"Server with ID {entry.id} already exists"},
+                    status_code=409
+                )
+            
+            # Create the entry
+            server_id = await database.create_entry(entry)
+            
+            # Optionally load the server immediately
+            if data.get("load_immediately", False):
+                await hub._load_server(entry)
+            
+            return JSONResponse({
+                "message": "Server publication successful",
+                "id": server_id
+            }, status_code=201)
+            
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    
+    routes.append(Route("/v0/publish", endpoint=publish_server, methods=["POST"]))
+    
+    # Update server (requires auth)
+    async def update_server(request: Request):
+        if not hasattr(request, "user") or not request.user.is_authenticated:
+            return JSONResponse({"error": "Authentication required"}, status_code=401)
+        
+        server_id = request.path_params["id"]
+        
+        try:
+            data = await request.json()
+            
+            # Get existing entry
+            existing = await database.get_entry(server_id)
+            if not existing:
+                return JSONResponse({"error": "Server not found"}, status_code=404)
+            
+            # Update fields
+            for key, value in data.items():
+                if hasattr(existing, key) and key not in ["id", "created_at"]:
+                    setattr(existing, key, value)
+            
+            # Save updates
+            success = await database.update_entry(server_id, existing)
+            
+            if success:
+                # Reload server if it was already loaded
+                if server_id in hub.loaded_servers:
+                    await hub._load_server(existing)
+                
+                return JSONResponse({"message": "Server updated successfully"})
+            else:
+                return JSONResponse({"error": "Failed to update server"}, status_code=500)
+                
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    
+    routes.append(Route("/v0/servers/{id}", endpoint=update_server, methods=["PUT"]))
+    
+    # Delete server (requires auth)
+    async def delete_server(request: Request):
+        if not hasattr(request, "user") or not request.user.is_authenticated:
+            return JSONResponse({"error": "Authentication required"}, status_code=401)
+        
+        server_id = request.path_params["id"]
+        
+        # Remove from loaded servers if present
+        if server_id in hub.loaded_servers:
+            del hub.loaded_servers[server_id]
+        
+        # Delete from database
+        success = await database.delete_entry(server_id)
+        
+        if success:
+            return JSONResponse({"message": "Server deleted successfully"})
+        else:
+            return JSONResponse({"error": "Server not found"}, status_code=404)
+    
+    routes.append(Route("/v0/servers/{id}", endpoint=delete_server, methods=["DELETE"]))
+    
+    return routes
+```
+
+**api/health.py**:
+```python
+from typing import List
+from starlette.routing import Route
+from starlette.responses import JSONResponse
+from starlette.requests import Request
+
+from ..database.interface import RegistryDatabase
+
+
+def create_health_routes(database: RegistryDatabase, hub, config) -> List[Route]:
+    """Create health and status routes"""
+    routes = []
+    
+    # Health check
+    async def health_check(request: Request):
+        try:
+            # Check database connection
+            await database.get_entry("test")
+            db_healthy = True
+        except Exception:
+            db_healthy = False
+        
+        # Count servers
+        total_servers = len(await database.list_entries())
+        loaded_servers = len(hub.loaded_servers)
+        healthy_servers = sum(
+            1 for data in hub.loaded_servers.values()
+            if data.get("status") == "healthy"
+        )
+        
+        # Determine overall status
+        if db_healthy and healthy_servers == loaded_servers:
+            overall_status = "ok"
+        elif db_healthy and healthy_servers > 0:
+            overall_status = "degraded"
+        else:
+            overall_status = "unhealthy"
+        
+        return JSONResponse({
+            "status": overall_status,
+            "components": {
+                "database": "healthy" if db_healthy else "unhealthy",
+                "hub": {
+                    "total_servers": total_servers,
+                    "loaded_servers": loaded_servers,
+                    "healthy_servers": healthy_servers
+                }
+            },
+            "version": config.get("version", "1.0.0")
+        })
+    
+    routes.append(Route("/v0/health", endpoint=health_check, methods=["GET"]))
+    
+    # Ping endpoint
+    async def ping(request: Request):
+        return JSONResponse({
+            "environment": config.get("environment", "production"),
+            "version": f"registry-{config.get('version', '1.0.0')}"
+        })
+    
+    routes.append(Route("/v0/ping", endpoint=ping, methods=["GET"]))
+    
+    # Status endpoint
+    async def status(request: Request):
+        servers_status = {}
+        
+        for server_id, data in hub.loaded_servers.items():
+            entry = data.get("entry")
+            servers_status[server_id] = {
+                "name": entry.name if entry else server_id,
+                "status": data.get("status", "unknown"),
+                "loaded_at": data.get("loaded_at").isoformat() if data.get("loaded_at") else None,
+                "error": data.get("error")
+            }
+        
+        return JSONResponse({
+            "hub": {
+                "name": config.get("name", "MCP Hub Registry"),
+                "uptime": hub.get_uptime() if hasattr(hub, "get_uptime") else None
+            },
+            "servers": servers_status,
+            "stats": {
+                "total_registered": len(await database.list_entries()),
+                "total_loaded": len(hub.loaded_servers),
+                "healthy": sum(1 for d in hub.loaded_servers.values() if d.get("status") == "healthy"),
+                "failed": sum(1 for d in hub.loaded_servers.values() if d.get("status") == "failed")
+            }
+        })
+    
+    routes.append(Route("/v0/status", endpoint=status, methods=["GET"]))
+    
+    return routes
+```
+
+**api/auth.py**:
+```python
+from typing import List, Optional, Tuple
+from starlette.authentication import (
+    AuthenticationBackend,
+    AuthCredentials,
+    BaseUser,
+    AuthenticationError
+)
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.requests import Request
+
+
+class SimpleUser(BaseUser):
+    """Simple authenticated user"""
+    
+    def __init__(self, username: str):
+        self.username = username
+    
+    @property
+    def is_authenticated(self) -> bool:
+        return True
+    
+    @property
+    def display_name(self) -> str:
+        return self.username
+
+
+class BearerTokenBackend(AuthenticationBackend):
+    """Bearer token authentication backend"""
+    
+    def __init__(self, valid_tokens: List[str]):
+        self.valid_tokens = set(valid_tokens)
+    
+    async def authenticate(
+        self, request: Request
+    ) -> Optional[Tuple[AuthCredentials, BaseUser]]:
+        # Check Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return None
+        
+        # Parse bearer token
+        try:
+            scheme, token = auth_header.split()
+            if scheme.lower() != "bearer":
+                return None
+        except ValueError:
+            return None
+        
+        # Validate token
+        if token not in self.valid_tokens:
+            raise AuthenticationError("Invalid authentication token")
+        
+        # Return authenticated user
+        return AuthCredentials(["authenticated"]), SimpleUser("api_user")
+
+
+def create_auth_middleware(valid_tokens: List[str]) -> AuthenticationMiddleware:
+    """Create authentication middleware with bearer token backend"""
+    backend = BearerTokenBackend(valid_tokens)
+    return AuthenticationMiddleware(backend=backend)
+```
+
+## Core
+
+**core/__init__.py**:
+```python
+from .hub import MCPHubRegistry
+from .config import Config
+from .exceptions import (
+    MCPHubException,
+    ServerLoadException,
+    ConfigurationException,
+    DatabaseException
+)
+
+__all__ = [
+    "MCPHubRegistry",
+    "Config",
+    "MCPHubException",
+    "ServerLoadException",
+    "ConfigurationException",
+    "DatabaseException"
+]
+```
+
+**core/config.py**:
+```python
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import toml
+import yaml
+from pydantic import BaseModel, Field
+
+
+class DatabaseConfig(BaseModel):
+    type: str = "memory"  # mongodb, postgresql, memory
+    url: Optional[str] = None
+    database_name: str = "mcp-registry"
+    collection_name: str = "servers"
+
+
+class APIConfig(BaseModel):
+    host: str = "0.0.0.0"
+    port: int = 8080
+    auth_enabled: bool = False
+    auth_tokens: List[str] = Field(default_factory=list)
+    log_level: str = "info"
+
+
+class LoaderConfig(BaseModel):
+    timeout: float = 30.0
+    retry_attempts: int = 3
+    retry_delay: float = 2.0
+
+
+class SeedConfig(BaseModel):
+    import_on_startup: bool = False
+    file_path: Optional[str] = None
+
+
+class Config(BaseModel):
+    """Main configuration for MCP Hub Registry"""
+    name: str = "MCP Hub Registry"
+    version: str = "1.0.0"
+    environment: str = "production"
+    
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    api: APIConfig = Field(default_factory=APIConfig)
+    loader: LoaderConfig = Field(default_factory=LoaderConfig)
+    seed: SeedConfig = Field(default_factory=SeedConfig)
+    
+    # Hub-specific settings
+    hub: Dict[str, Any] = Field(default_factory=dict)
+    
+    @classmethod
+    def from_file(cls, file_path: str) -> "Config":
+        """Load configuration from TOML or YAML file"""
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {file_path}")
+        
+        content = path.read_text()
+        
+        if path.suffix in ['.toml', '.tml']:
+            data = toml.loads(content)
+        elif path.suffix in ['.yaml', '.yml']:
+            data = yaml.safe_load(content)
+        else:
+            raise ValueError(f"Unsupported config file format: {path.suffix}")
+        
+        return cls(**data)
+    
+    @classmethod
+    def from_env(cls, prefix: str = "MCP_REGISTRY_") -> "Config":
+        """Load configuration from environment variables"""
+        config_data = {}
+        
+        # Check for config file env var first
+        config_file = os.getenv(f"{prefix}CONFIG_FILE")
+        if config_file:
+            return cls.from_file(config_file)
+        
+        # Parse individual env vars
+        for key, value in os.environ.items():
+            if key.startswith(prefix):
+                # Remove prefix and convert to lowercase
+                config_key = key[len(prefix):].lower()
+                
+                # Handle nested keys (e.g., DATABASE_URL -> database.url)
+                parts = config_key.split('_')
+                
+                current = config_data
+                for part in parts[:-1]:
+                    if part not in current:
+                        current[part] = {}
+                    current = current[part]
+                
+                # Convert value types
+                if value.lower() in ['true', 'false']:
+                    value = value.lower() == 'true'
+                elif value.isdigit():
+                    value = int(value)
+                elif '.' in value and value.replace('.', '').isdigit():
+                    value = float(value)
+                
+                current[parts[-1]] = value
+        
+        return cls(**config_data)
+```
+
+**core/exceptions.py**:
+```python
+class MCPHubException(Exception):
+    """Base exception for MCP Hub Registry"""
+    pass
+
+
+class ServerLoadException(MCPHubException):
+    """Exception raised when a server fails to load"""
+    pass
+
+
+class ConfigurationException(MCPHubException):
+    """Exception raised for configuration errors"""
+    pass
+
+
+class DatabaseException(MCPHubException):
+    """Exception raised for database errors"""
+    pass
+
+
+class AuthenticationException(MCPHubException):
+    """Exception raised for authentication errors"""
+    pass
+
+
+class ValidationException(MCPHubException):
+    """Exception raised for validation errors"""
+    pass
+```
+
+This completes the implementation of all the files in the proposed MCP Hub Registry structure. The system now includes:
+
+1. **CLI Interface** - Full command-line management
+2. **Database Abstraction** - MongoDB and in-memory implementations
+3. **Multiple Loaders** - OpenAPI, Module, NPM, Docker, PyPI
+4. **API Layer** - Registry-compatible endpoints with authentication
+5. **Configuration System** - TOML/YAML file and environment variable support
+6. **Error Handling** - Comprehensive exception hierarchy
+
+The hub can now function as both a registry for discovering MCP servers and a runtime environment for hosting them dynamically.
