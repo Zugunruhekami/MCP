@@ -2878,3 +2878,506 @@ def migrate_openapi_config(old_config: Dict[str, Any]) -> Dict[str, Any]:
 ```
 
 This integration with FastMCP's OpenAPI features makes the implementation cleaner, more maintainable, and fully compatible with FastMCP's ecosystem.
+
+
+
+
+
+
+
+
+
+
+
+
+*Thinking...*
+
+> The user wants me to stick with YAML configuration files and provide concrete examples and instructions for running the project. I should provide:
+> 
+> 1. Example YAML configuration files
+> 2. Clear instructions on how to run the project
+> 3. Make sure the YAML approach is consistent throughout
+> 
+> Let me provide:
+> - config.yaml (main configuration)
+> - servers.yaml (seed data with server configurations)
+> - docker-compose.yml
+> - Clear step-by-step instructions
+> - .env.example file
+> - README with concrete examples
+
+Here are the YAML configuration files and concrete instructions for running the MCP Hub Registry:
+
+## Configuration Files
+
+### **config.yaml** (Main Hub Configuration)
+```yaml
+# MCP Hub Registry Configuration
+hub:
+  name: "MCP Hub Registry"
+  version: "1.0.0"
+  description: "Community-driven MCP server registry and hub"
+  
+database:
+  type: "mongodb"  # Options: mongodb, memory
+  url: "${DATABASE_URL:-mongodb://localhost:27017}"
+  database_name: "mcp-registry"
+  collection_name: "servers"
+  
+api:
+  host: "0.0.0.0"
+  port: 8080
+  auth_enabled: true
+  auth_tokens:
+    - "${AUTH_TOKEN:-dev-token-12345}"
+  log_level: "info"
+  
+loader:
+  timeout: 30.0
+  retry_attempts: 3
+  retry_delay: 2.0
+  
+seed:
+  import_on_startup: true
+  file_path: "data/servers.yaml"
+```
+
+### **data/servers.yaml** (Server Configurations)
+```yaml
+servers:
+  # OpenAPI-based server example
+  - id: "github-api"
+    name: "GitHub API Server"
+    description: "MCP server for GitHub API v3"
+    repository:
+      url: "https://github.com/example/github-mcp-server"
+      source: "github"
+    version_detail:
+      version: "1.0.0"
+      release_date: "2025-01-15T00:00:00Z"
+      is_latest: true
+    openapi_config:
+      url: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.yaml"
+      base_url: "https://api.github.com"
+      timeout: 30.0
+      route_maps:
+        - methods: ["GET"]
+          pattern: "^/repos/[^/]+/[^/]+$"
+          mcp_type: "RESOURCE_TEMPLATE"
+          mcp_tags: ["repository", "read"]
+        - methods: ["GET"]
+          pattern: "^/users/[^/]+$"
+          mcp_type: "RESOURCE_TEMPLATE"
+          mcp_tags: ["user", "read"]
+        - methods: ["POST", "PUT", "PATCH", "DELETE"]
+          pattern: ".*"
+          mcp_type: "TOOL"
+          mcp_tags: ["write"]
+        - pattern: "^/admin/.*"
+          mcp_type: "EXCLUDE"
+      mcp_names:
+        "repos/get": "get_repository"
+        "repos/create": "create_repository"
+        "issues/list": "list_issues"
+      mcp_component_fn:
+        add_tags: ["github", "vcs"]
+        prefix_tools: "🔧"
+        prefix_resources: "📊"
+    auth_config:
+      type: "bearer"
+      token: "${GITHUB_TOKEN}"
+    tags: ["vcs", "api", "external"]
+    enabled: true
+
+  # NPM package server example
+  - id: "sqlite-server"
+    name: "SQLite Database Server"
+    description: "MCP server for SQLite database operations"
+    repository:
+      url: "https://github.com/example/sqlite-mcp-server"
+      source: "github"
+    version_detail:
+      version: "1.0.0"
+      release_date: "2025-01-15T00:00:00Z"
+      is_latest: true
+    packages:
+      - registry_name: "npm"
+        name: "@modelcontextprotocol/server-sqlite"
+        version: "0.1.0"
+        package_arguments:
+          - description: "Path to SQLite database"
+            is_required: true
+            format: "string"
+            value: "./database.db"
+            type: "positional"
+        environment_variables:
+          - name: "SQLITE_READ_ONLY"
+            description: "Enable read-only mode"
+            required: false
+            default: "false"
+    tags: ["database", "local", "sql"]
+    enabled: true
+
+  # Python module server example
+  - id: "file-system-server"
+    name: "File System Server"
+    description: "MCP server for file system operations"
+    repository:
+      url: ""
+      source: "custom"
+    version_detail:
+      version: "1.0.0"
+      release_date: "2025-01-15T00:00:00Z"
+      is_latest: true
+    packages:
+      - registry_name: "pypi"
+        name: "mcp-filesystem"
+        version: "1.0.0"
+        package_arguments:
+          - description: "Root directory path"
+            is_required: true
+            format: "string"
+            value: "/workspace"
+            type: "positional"
+    tags: ["filesystem", "local", "tools"]
+    enabled: false
+
+  # Docker-based server example
+  - id: "postgres-server"
+    name: "PostgreSQL Server"
+    description: "MCP server for PostgreSQL operations"
+    repository:
+      url: "https://github.com/example/postgres-mcp-server"
+      source: "github"
+    version_detail:
+      version: "1.0.0"
+      release_date: "2025-01-15T00:00:00Z"
+      is_latest: true
+    packages:
+      - registry_name: "docker"
+        name: "mcp/postgres-server"
+        version: "latest"
+        runtime_arguments:
+          - description: "Mount PostgreSQL socket"
+            value: "-v /var/run/postgresql:/var/run/postgresql"
+            type: "positional"
+        environment_variables:
+          - name: "POSTGRES_CONNECTION"
+            description: "PostgreSQL connection string"
+            required: true
+            default: "postgresql://user:pass@localhost/db"
+    tags: ["database", "sql", "docker"]
+    enabled: false
+```
+
+### **.env.example**
+```bash
+# Database Configuration
+DATABASE_URL=mongodb://localhost:27017
+
+# API Authentication
+AUTH_TOKEN=your-secret-auth-token-here
+
+# External API Keys
+GITHUB_TOKEN=ghp_your_github_token_here
+OPENAI_API_KEY=sk-your_openai_key_here
+
+# Optional Configuration
+MCP_REGISTRY_API_PORT=8080
+MCP_REGISTRY_LOG_LEVEL=info
+```
+
+### **docker-compose.yml**
+```yaml
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: mcp-hub-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=mcp-registry
+    networks:
+      - mcp-network
+
+  mcp-hub:
+    build: .
+    container_name: mcp-hub-registry
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mongodb
+    environment:
+      - DATABASE_URL=mongodb://mongodb:27017
+      - AUTH_TOKEN=${AUTH_TOKEN:-dev-token-12345}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data:ro
+    command: python -m mcp_hub_registry run -c /app/config.yaml
+    networks:
+      - mcp-network
+
+volumes:
+  mongo_data:
+
+networks:
+  mcp-network:
+    driver: bridge
+```
+
+### **Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Install the package
+RUN pip install -e .
+
+# Create data directory
+RUN mkdir -p /app/data
+
+# Expose port
+EXPOSE 8080
+
+# Default command
+CMD ["python", "-m", "mcp_hub_registry", "run"]
+```
+
+### **requirements.txt**
+```txt
+fastmcp>=0.2.0
+httpx>=0.25.0
+pydantic>=2.0.0
+motor>=3.3.0
+starlette>=0.37.0
+uvicorn>=0.27.0
+click>=8.1.0
+pyyaml>=6.0
+```
+
+## Running Instructions
+
+### **1. Local Development Setup**
+
+```bash
+# Clone the repository
+git clone https://github.com/your-org/mcp-hub-registry.git
+cd mcp-hub-registry
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+pip install -e .
+
+# Copy environment file
+cp .env.example .env
+# Edit .env with your configuration
+
+# Start MongoDB (if not using Docker)
+# On macOS with Homebrew:
+brew services start mongodb-community
+
+# On Ubuntu:
+sudo systemctl start mongod
+```
+
+### **2. Initialize and Run**
+
+```bash
+# Initialize configuration (creates config.yaml)
+python -m mcp_hub_registry init-config
+
+# Import seed servers
+python -m mcp_hub_registry import-seed data/servers.yaml
+
+# Run the hub
+python -m mcp_hub_registry run -c config.yaml
+```
+
+### **3. Docker Deployment**
+
+```bash
+# Copy and configure environment
+cp .env.example .env
+# Edit .env with your tokens
+
+# Build and run with Docker Compose
+docker-compose up -d
+
+# View logs
+docker-compose logs -f mcp-hub
+
+# Stop services
+docker-compose down
+```
+
+### **4. CLI Usage Examples**
+
+```bash
+# List all servers
+python -m mcp_hub_registry list
+
+# List only enabled servers
+python -m mcp_hub_registry list --enabled-only
+
+# Get server information
+python -m mcp_hub_registry info github-api
+
+# Enable/disable a server
+python -m mcp_hub_registry toggle github-api --disable
+python -m mcp_hub_registry toggle github-api --enable
+
+# Analyze an OpenAPI spec
+python -m mcp_hub_registry analyze-openapi https://petstore.swagger.io/v2/swagger.json
+
+# Generate server config from OpenAPI
+python -m mcp_hub_registry analyze-openapi \
+  https://api.example.com/openapi.yaml \
+  -o my-api-server.yaml \
+  --id my-api \
+  --name "My API Server"
+
+# Export all servers
+python -m mcp_hub_registry export-servers servers-backup.yaml
+```
+
+### **5. API Usage Examples**
+
+```bash
+# Health check
+curl http://localhost:8080/v0/health
+
+# List servers
+curl http://localhost:8080/v0/servers
+
+# Get server details
+curl http://localhost:8080/v0/servers/github-api
+
+# Search servers
+curl "http://localhost:8080/v0/search?q=github"
+
+# Publish a new server (requires auth)
+curl -X POST http://localhost:8080/v0/publish \
+  -H "Authorization: Bearer dev-token-12345" \
+  -H "Content-Type: application/yaml" \
+  --data-binary @new-server.yaml
+```
+
+### **6. Production Deployment**
+
+```bash
+# Create production config
+cp config.yaml config.prod.yaml
+# Edit config.prod.yaml with production settings
+
+# Set production environment variables
+export DATABASE_URL=mongodb://prod-mongo:27017
+export AUTH_TOKEN=your-production-token
+export MCP_REGISTRY_LOG_LEVEL=warning
+
+# Run with production config
+python -m mcp_hub_registry run -c config.prod.yaml
+```
+
+### **7. Adding a New Server**
+
+Create `my-new-server.yaml`:
+```yaml
+id: "my-api-server"
+name: "My API Server"
+description: "Custom API integration"
+repository:
+  url: "https://github.com/myorg/my-api-mcp"
+  source: "github"
+version_detail:
+  version: "1.0.0"
+  release_date: "2025-01-20T00:00:00Z"
+  is_latest: true
+openapi_config:
+  url: "https://api.myservice.com/openapi.yaml"
+  base_url: "https://api.myservice.com/v1"
+  route_maps:
+    - methods: ["GET"]
+      pattern: ".*"
+      mcp_type: "RESOURCE"
+auth_config:
+  type: "api_key"
+  header_name: "X-API-Key"
+  api_key: "${MY_API_KEY}"
+tags: ["custom", "api"]
+enabled: true
+```
+
+Then add it:
+```bash
+# Via CLI
+python -m mcp_hub_registry add-server my-new-server.yaml
+
+# Or via API
+curl -X POST http://localhost:8080/v0/publish \
+  -H "Authorization: Bearer dev-token-12345" \
+  -H "Content-Type: application/yaml" \
+  --data-binary @my-new-server.yaml
+```
+
+### **8. Monitoring and Troubleshooting**
+
+```bash
+# Check hub status
+curl http://localhost:8080/v0/status
+
+# View server logs (Docker)
+docker-compose logs mcp-hub --tail=100 -f
+
+# Check MongoDB
+docker exec -it mcp-hub-mongodb mongosh
+> use mcp-registry
+> db.servers.find().pretty()
+
+# Test OpenAPI conversion
+python -m mcp_hub_registry analyze-openapi \
+  https://api.github.com/openapi.yaml \
+  --test
+```
+
+## Directory Structure for Running
+
+```
+mcp-hub-registry/
+├── mcp_hub_registry/      # Package code
+├── data/
+│   └── servers.yaml       # Server configurations
+├── config.yaml           # Main configuration
+├── .env                  # Environment variables
+├── docker-compose.yml    # Docker setup
+├── Dockerfile           # Container definition
+├── requirements.txt     # Python dependencies
+└── README.md           # Documentation
+```
+
+This setup provides a complete, working MCP Hub Registry with YAML configuration, supporting multiple server types and deployment options.
