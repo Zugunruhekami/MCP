@@ -821,3 +821,370 @@ curl http://localhost:8000/github/repos/octocat/Hello-World
 8. **Route Mapping**: Control how OpenAPI routes become MCP components
 
 This implementation provides a robust MCP hub that can host multiple servers with proper error handling and monitoring.
+
+
+
+
+*Thinking...*
+
+> The user wants to change the CLI to load config files from a `/data` folder that's outside the source folder. I need to use proper path handling with pathlib to make this pythonic and cross-platform.
+> 
+> The typical structure would be:
+> ```
+> project/
+> ├── mcp_hub/  (source code)
+> │   ├── __init__.py
+> │   ├── cli.py
+> │   └── ...
+> ├── data/     (config files)
+> │   ├── config.yaml
+> │   └── servers.yaml
+> └── ...
+> ```
+> 
+> I should use Path.resolve() to handle relative paths properly and find the data directory relative to the project root.
+
+Here's the pythonic way to handle loading configuration files from a `/data` folder outside the source directory:
+
+```python
+# mcp_hub/cli.py
+
+import asyncio
+import click
+from pathlib import Path
+import sys
+
+from .server import MCPHub
+from .config import Config
+
+
+def find_project_root() -> Path:
+    """Find the project root directory (contains the data folder)"""
+    # Start from the current file's directory
+    current = Path(__file__).resolve().parent
+    
+    # Go up until we find a directory that contains 'data' folder
+    # or reach the root directory
+    while current != current.parent:
+        if (current / 'data').exists():
+            return current
+        # Also check if we're already at project root (has setup.py or pyproject.toml)
+        if (current / 'setup.py').exists() or (current / 'pyproject.toml').exists():
+            return current
+        current = current.parent
+    
+    # If not found, assume parent of mcp_hub package
+    return Path(__file__).resolve().parent.parent
+
+
+def get_data_path() -> Path:
+    """Get the data directory path"""
+    project_root = find_project_root()
+    data_path = project_root / 'data'
+    
+    # Create data directory if it doesn't exist
+    data_path.mkdir(exist_ok=True)
+    
+    return data_path
+
+
+@click.group()
+@click.option('--data-dir', envvar='MCP_HUB_DATA_DIR', 
+              help='Data directory path (default: <project_root>/data)')
+@click.pass_context
+def cli(ctx, data_dir):
+    """MCP Hub CLI"""
+    ctx.ensure_object(dict)
+    
+    # Set data directory
+    if data_dir:
+        ctx.obj['data_dir'] = Path(data_dir).resolve()
+    else:
+        ctx.obj['data_dir'] = get_data_path()
+
+
+@cli.command()
+@click.option('--config', '-c', default='config.yaml', 
+              help='Hub configuration file name (in data directory)')
+@click.option('--servers', '-s', default='servers.yaml', 
+              help='Servers configuration file name (in data directory)')
+@click.pass_context
+def run(ctx, config: str, servers: str):
+    """Run the MCP Hub server"""
+    
+    data_dir = ctx.obj.get('data_dir', get_data_path())
+    
+    # Construct full paths
+    config_path = data_dir / config
+    servers_path = data_dir / servers
+    
+    # Check if files exist
+    if not config_path.exists():
+        click.echo(f"Error: Config file not found: {config_path}", err=True)
+        click.echo(f"Run 'mcp-hub init' to create default configuration files.", err=True)
+        sys.exit(1)
+    
+    if not servers_path.exists():
+        click.echo(f"Warning: Servers file not found: {servers_path}", err=True)
+        click.echo(f"Creating empty servers configuration...", err=True)
+        servers_path = None  # Will use empty servers list
+    
+    # Load configuration
+    click.echo(f"Loading configuration from: {config_path}")
+    if servers_path:
+        click.echo(f"Loading servers from: {servers_path}")
+    
+    try:
+        hub_config = Config.from_file(str(config_path), str(servers_path) if servers_path else None)
+    except Exception as e:
+        click.echo(f"Error loading configuration: {e}", err=True)
+        sys.exit(1)
+    
+    # Create and run hub
+    hub = MCPHub(hub_config)
+    
+    click.echo(f"Starting {hub_config.hub.name} on {hub_config.hub.host}:{hub_config.hub.port}")
+    asyncio.run(hub.run())
+
+
+@cli.command()
+@click.option('--force', '-f', is_flag=True, help='Overwrite existing files')
+@click.pass_context
+def init(ctx, force: bool):
+    """Initialize configuration files in the data directory"""
+    
+    data_dir = ctx.obj.get('data_dir', get_data_path())
+    
+    # Ensure data directory exists
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    config_path = data_dir / 'config.yaml'
+    servers_path = data_dir / 'servers.yaml'
+    
+    # Check if files already exist
+    if config_path.exists() and not force:
+        click.echo(f"Config file already exists: {config_path}")
+        click.echo("Use --force to overwrite")
+        return
+    
+    # Create default config.yaml
+    config_content = """# MCP Hub Configuration
+hub:
+  name: "MCP Hub"
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "info"
+  health_check_enabled: true
+  timeout: 30.0
+"""
+    
+    # Create default servers.yaml
+    servers_content = """# MCP Servers Configuration
+servers:
+  # Example OpenAPI-based server
+  - id: "example-api"
+    name: "Example API Server"
+    description: "Example OpenAPI-based MCP server"
+    type: "openapi"
+    openapi_url: "https://petstore.swagger.io/v2/swagger.json"
+    base_url: "https://petstore.swagger.io/v2"
+    mount_path: "/example"
+    enabled: true
+    route_maps:
+      - methods: ["GET"]
+        pattern: "^/pet/.*"
+        mcp_type: "RESOURCE_TEMPLATE"
+        mcp_tags: ["pet", "read"]
+      - methods: ["POST", "PUT", "DELETE"]
+        pattern: ".*"
+        mcp_type: "TOOL"
+        mcp_tags: ["write"]
+
+  # Add your servers here
+  # - id: "my-server"
+  #   name: "My Server"
+  #   type: "openapi"
+  #   openapi_url: "https://api.example.com/openapi.json"
+  #   mount_path: "/my-api"
+  #   enabled: true
+"""
+    
+    # Write files
+    config_path.write_text(config_content)
+    servers_path.write_text(servers_content)
+    
+    click.echo(f"Created configuration files in: {data_dir}")
+    click.echo(f"  - {config_path}")
+    click.echo(f"  - {servers_path}")
+    click.echo("\nEdit these files and run: mcp-hub run")
+
+
+@cli.command()
+@click.pass_context
+def info(ctx):
+    """Show information about the MCP Hub installation"""
+    
+    data_dir = ctx.obj.get('data_dir', get_data_path())
+    project_root = find_project_root()
+    
+    click.echo("MCP Hub Information")
+    click.echo("=" * 40)
+    click.echo(f"Project root: {project_root}")
+    click.echo(f"Data directory: {data_dir}")
+    click.echo(f"Data dir exists: {data_dir.exists()}")
+    
+    if data_dir.exists():
+        config_path = data_dir / 'config.yaml'
+        servers_path = data_dir / 'servers.yaml'
+        
+        click.echo(f"\nConfiguration files:")
+        click.echo(f"  config.yaml: {'Found' if config_path.exists() else 'Not found'}")
+        click.echo(f"  servers.yaml: {'Found' if servers_path.exists() else 'Not found'}")
+        
+        # List all yaml files in data directory
+        yaml_files = list(data_dir.glob('*.yaml')) + list(data_dir.glob('*.yml'))
+        if yaml_files:
+            click.echo(f"\nAvailable configuration files:")
+            for f in yaml_files:
+                click.echo(f"  - {f.name}")
+
+
+# Alternative approach using environment-based configuration
+@cli.command()
+@click.option('--env', '-e', default='development', 
+              type=click.Choice(['development', 'staging', 'production']),
+              help='Environment to load configuration for')
+@click.pass_context
+def run_env(ctx, env: str):
+    """Run MCP Hub with environment-specific configuration"""
+    
+    data_dir = ctx.obj.get('data_dir', get_data_path())
+    
+    # Look for environment-specific files
+    config_path = data_dir / f'config.{env}.yaml'
+    servers_path = data_dir / f'servers.{env}.yaml'
+    
+    # Fall back to default files if env-specific don't exist
+    if not config_path.exists():
+        config_path = data_dir / 'config.yaml'
+    if not servers_path.exists():
+        servers_path = data_dir / 'servers.yaml'
+    
+    if not config_path.exists():
+        click.echo(f"Error: No configuration found for environment: {env}", err=True)
+        sys.exit(1)
+    
+    click.echo(f"Running in {env} environment")
+    ctx.invoke(run, config=config_path.name, servers=servers_path.name)
+
+
+if __name__ == '__main__':
+    cli()
+```
+
+Also update the `Config.from_file` method to handle Path objects properly:
+
+```python
+# mcp_hub/config.py
+
+from pathlib import Path
+# ... other imports ...
+
+class Config(BaseModel):
+    hub: HubConfig = Field(default_factory=HubConfig)
+    servers: List[ServerConfig] = Field(default_factory=list)
+    
+    @classmethod
+    def from_file(cls, config_path: str | Path, servers_path: Optional[str | Path] = None) -> "Config":
+        """Load configuration from YAML files"""
+        # Convert to Path objects
+        config_path = Path(config_path)
+        
+        # Load hub config
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        # Load servers config if provided
+        if servers_path:
+            servers_path = Path(servers_path)
+            if servers_path.exists():
+                with open(servers_path, 'r') as f:
+                    servers_data = yaml.safe_load(f)
+                    config_data['servers'] = servers_data.get('servers', [])
+        
+        # Substitute environment variables
+        config_data = substitute_env_vars(config_data)
+        
+        return cls(**config_data)
+```
+
+## Directory Structure
+
+The expected directory structure would be:
+
+```
+mcp-hub-project/
+├── mcp_hub/           # Source code
+│   ├── __init__.py
+│   ├── cli.py
+│   ├── config.py
+│   ├── server.py
+│   └── ...
+├── data/              # Configuration files
+│   ├── config.yaml
+│   ├── servers.yaml
+│   ├── config.production.yaml  # Optional env-specific
+│   └── servers.production.yaml # Optional env-specific
+├── setup.py
+├── requirements.txt
+└── README.md
+```
+
+## Usage Examples
+
+```bash
+# Initialize configuration files in data directory
+mcp-hub init
+
+# Run with default configuration files from data/
+mcp-hub run
+
+# Run with specific config files from data/
+mcp-hub run --config my-config.yaml --servers my-servers.yaml
+
+# Use a different data directory
+mcp-hub --data-dir /path/to/configs run
+
+# Or use environment variable
+export MCP_HUB_DATA_DIR=/path/to/configs
+mcp-hub run
+
+# Show hub information
+mcp-hub info
+
+# Run with environment-specific configs
+mcp-hub run-env --env production  # Uses config.production.yaml if exists
+```
+
+## Additional Features
+
+1. **Environment Variable for Data Directory**: 
+   ```bash
+   export MCP_HUB_DATA_DIR=/etc/mcp-hub
+   mcp-hub run
+   ```
+
+2. **Project Root Detection**: Automatically finds the project root by looking for common markers
+
+3. **Graceful File Handling**: Warns when files don't exist and provides helpful messages
+
+4. **Environment-Specific Configs**: Support for `config.{env}.yaml` pattern
+
+5. **Info Command**: Shows where configuration files are located
+
+This approach provides:
+- Clean separation between code and configuration
+- Flexibility in configuration location
+- Environment-based configuration support
+- Better organization for production deployments
+- Cross-platform path handling using `pathlib`
