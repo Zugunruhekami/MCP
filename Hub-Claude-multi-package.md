@@ -1485,3 +1485,434 @@ class RemoteProxyLoader(ServerLoader):
 6. **Multi-Server Support**: Native support for MCPConfig format with multiple servers
 
 This approach is much cleaner and leverages FastMCP's excellent proxy capabilities instead of building our own transport adapters!
+
+
+
+Absolutely! Let's make the return types consistent throughout the codebase by using `LoadResult` everywhere. Here's the refactored version:
+
+## 1. **Updated loaders/factory.py** with Consistent `LoadResult` Returns
+
+```python
+import asyncio
+import logging
+from typing import Optional
+
+from .base import ServerLoader, LoadResult
+from .openapi import OpenAPIServerLoader
+from .module import ModuleServerLoader
+from .uvx import UVXServerLoader
+from .npm import NPMServerLoader
+from .pypi import PyPIServerLoader
+from .composite import CompositeServerLoader
+from .remote import RemoteProxyLoader
+from ..config import ServerConfig
+
+logger = logging.getLogger(__name__)
+
+
+def get_loader_for_config(config: ServerConfig) -> Optional[ServerLoader]:
+    """Get the appropriate loader based on configuration"""
+    
+    # 1. Check for composite/multi-server config
+    if hasattr(config, 'mcp_config') and config.mcp_config:
+        return CompositeServerLoader()
+    
+    # 2. Check for remote proxy config
+    if hasattr(config, 'remote_proxy') and config.remote_proxy:
+        return RemoteProxyLoader()
+    
+    # 3. Check for OpenAPI
+    if hasattr(config, 'openapi_url') and config.openapi_url:
+        return OpenAPIServerLoader()
+    
+    # 4. Check for module
+    if hasattr(config, 'module_path') and config.module_path:
+        return ModuleServerLoader()
+    
+    # 5. Check for packages
+    if hasattr(config, 'packages') and config.packages:
+        # Get loader based on first package's registry
+        registry_name = config.packages[0].registry_name
+        
+        loader_map = {
+            "uvx": UVXServerLoader,
+            "npm": NPMServerLoader,
+            "pypi": PyPIServerLoader,
+        }
+        
+        loader_class = loader_map.get(registry_name)
+        if loader_class:
+            return loader_class()
+    
+    logger.error(f"No suitable loader found for server: {config.id}")
+    return None
+
+
+async def load_server(config: ServerConfig) -> LoadResult:
+    """Load a server using the appropriate loader"""
+    loader = get_loader_for_config(config)
+    
+    if not loader:
+        return LoadResult(
+            success=False,
+            error=f"No loader available for server configuration: {config.id}"
+        )
+    
+    return await loader.load(config)
+
+
+async def load_server_with_retry(config: ServerConfig) -> LoadResult:
+    """Load a server with retry logic - returns LoadResult consistently"""
+    
+    result = None
+    last_error = None
+    
+    for attempt in range(config.retry_attempts):
+        if attempt > 0:
+            logger.info(f"Retrying server '{config.id}' (attempt {attempt + 1}/{config.retry_attempts})")
+            await asyncio.sleep(config.retry_delay)
+        
+        result = await load_server(config)
+        
+        if result.success:
+            return result
+        
+        last_error = result.error
+    
+    # All retries failed
+    return LoadResult(
+        success=False,
+        error=last_error or "Max retries exceeded"
+    )
+
+
+# Backward compatibility wrapper (deprecated)
+async def load_server_with_retry_legacy(config: ServerConfig) -> tuple:
+    """
+    Legacy wrapper that returns tuple format.
+    
+    DEPRECATED: Use load_server_with_retry() which returns LoadResult
+    """
+    import warnings
+    warnings.warn(
+        "load_server_with_retry_legacy is deprecated. Use load_server_with_retry() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
+    result = await load_server_with_retry(config)
+    return result.mcp_instance, result.app, result.error
+```
+
+## 2. **Updated server.py** to Use `LoadResult`
+
+```python
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from typing import List, Dict
+
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse
+import uvicorn
+
+from .config import Config
+from .registry import MCPRegistry, ServerInfo, ServerStatus
+from .loaders import load_server_with_retry, create_fallback_app
+
+logger = logging.getLogger(__name__)
+
+
+class MCPHub:
+    """Main MCP Hub server that hosts multiple MCP servers"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.registry = MCPRegistry()
+        self.logger = logging.getLogger(__name__)
+        
+        # Configure logging
+        logging.basicConfig(
+            level=getattr(logging, config.hub.log_level.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+    
+    async def load_all_servers(self) -> tuple:
+        """Load all configured servers concurrently"""
+        routes = []
+        apps = []
+        
+        # Load servers concurrently
+        tasks = []
+        for server_config in self.config.servers:
+            if not server_config.enabled:
+                self.logger.info(f"Server '{server_config.id}' is disabled")
+                self.registry.register(ServerInfo(
+                    id=server_config.id,
+                    name=server_config.name,
+                    status=ServerStatus.DISABLED,
+                    mount_path=server_config.mount_path
+                ))
+                continue
+            
+            # Register as loading
+            self.registry.register(ServerInfo(
+                id=server_config.id,
+                name=server_config.name,
+                status=ServerStatus.LOADING,
+                mount_path=server_config.mount_path
+            ))
+            
+            tasks.append((server_config, load_server_with_retry(server_config)))
+        
+        # Wait for all servers to load
+        results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+        
+        # Process results
+        for (server_config, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                # Handle unexpected exceptions
+                error_msg = f"Unexpected error: {str(result)}"
+                self.logger.error(f"Server '{server_config.id}': {error_msg}")
+                
+                app = create_fallback_app(server_config.id, server_config.name, error_msg)
+                info = self.registry.get(server_config.id)
+                info.status = ServerStatus.FAILED
+                info.error = error_msg
+                info.app = app
+                
+            elif isinstance(result, LoadResult):
+                # Process LoadResult
+                info = self.registry.get(server_config.id)
+                
+                if result.success and result.app:
+                    # Successfully loaded
+                    info.mcp_instance = result.mcp_instance
+                    info.app = result.app
+                    info.status = ServerStatus.HEALTHY
+                    info.loaded_at = result.loaded_at
+                    info.connection_info = result.connection_info
+                    
+                    # Store cleanup function if provided
+                    if result.cleanup_func:
+                        info.cleanup_func = result.cleanup_func
+                    
+                    # Update capabilities if MCP instance available
+                    if result.mcp_instance:
+                        self.registry.update_capabilities(server_config.id, result.mcp_instance)
+                    
+                    self.logger.info(f"Server '{server_config.id}' loaded successfully")
+                    app = result.app
+                    
+                else:
+                    # Failed to load
+                    error = result.error or "Unknown error"
+                    app = create_fallback_app(server_config.id, server_config.name, error)
+                    info.status = ServerStatus.FAILED
+                    info.error = error
+                    info.app = app
+                    self.logger.error(f"Server '{server_config.id}' failed: {error}")
+            
+            else:
+                # Unexpected result type
+                error_msg = f"Unexpected result type: {type(result)}"
+                self.logger.error(f"Server '{server_config.id}': {error_msg}")
+                
+                app = create_fallback_app(server_config.id, server_config.name, error_msg)
+                info = self.registry.get(server_config.id)
+                info.status = ServerStatus.FAILED
+                info.error = error_msg
+                info.app = app
+            
+            routes.append(Mount(server_config.mount_path, app=app))
+            apps.append(app)
+        
+        return routes, apps
+    
+    def create_lifespan(self, apps: List[Starlette]):
+        """Create combined lifespan for all apps with cleanup"""
+        
+        @asynccontextmanager
+        async def lifespan(app):
+            # Startup
+            self.logger.info(f"Starting {self.config.hub.name}...")
+            yield
+            
+            # Shutdown - run all cleanup functions
+            self.logger.info(f"Shutting down {self.config.hub.name}...")
+            
+            # Clean up all servers
+            cleanup_tasks = []
+            for server_id, info in self.registry.get_all().items():
+                if hasattr(info, 'cleanup_func') and info.cleanup_func:
+                    self.logger.info(f"Cleaning up server '{server_id}'...")
+                    cleanup_tasks.append(info.cleanup_func())
+            
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        
+        return lifespan
+    
+    # ... rest of MCPHub implementation remains the same ...
+```
+
+## 3. **Enhanced registry.py** to Store LoadResult Data
+
+```python
+import logging
+from datetime import datetime
+from typing import Dict, Optional, Any, Callable
+from enum import Enum
+from dataclasses import dataclass, field
+
+from fastmcp import FastMCP
+from starlette.applications import Starlette
+
+
+class ServerStatus(Enum):
+    LOADING = "loading"
+    HEALTHY = "healthy"
+    FAILED = "failed"
+    DISABLED = "disabled"
+
+
+@dataclass
+class ServerInfo:
+    id: str
+    name: str
+    status: ServerStatus
+    mount_path: str
+    error: Optional[str] = None
+    mcp_instance: Optional[FastMCP] = None
+    app: Optional[Starlette] = None
+    loaded_at: Optional[datetime] = None
+    capabilities: Dict = field(default_factory=dict)
+    connection_info: Optional[Dict[str, Any]] = None
+    cleanup_func: Optional[Callable] = None
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for API responses"""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status.value,
+            "mount_path": self.mount_path,
+            "error": self.error,
+            "loaded_at": self.loaded_at.isoformat() if self.loaded_at else None,
+            "capabilities": self.capabilities,
+            "connection_info": self.connection_info
+        }
+
+
+class MCPRegistry:
+    """Registry for tracking MCP servers in the hub"""
+    
+    def __init__(self):
+        self.servers: Dict[str, ServerInfo] = {}
+        self.logger = logging.getLogger(__name__)
+    
+    def register(self, server_info: ServerInfo):
+        """Register or update a server"""
+        self.servers[server_info.id] = server_info
+        self.logger.info(f"Registered server '{server_info.name}' with status: {server_info.status.value}")
+    
+    def get(self, server_id: str) -> Optional[ServerInfo]:
+        """Get server info by ID"""
+        return self.servers.get(server_id)
+    
+    def get_all(self) -> Dict[str, ServerInfo]:
+        """Get all servers"""
+        return self.servers.copy()
+    
+    def get_healthy(self) -> Dict[str, ServerInfo]:
+        """Get healthy servers"""
+        return {id: info for id, info in self.servers.items() 
+                if info.status == ServerStatus.HEALTHY}
+    
+    def update_capabilities(self, server_id: str, mcp: FastMCP):
+        """Update server capabilities"""
+        if server_id in self.servers:
+            try:
+                self.servers[server_id].capabilities = {
+                    "tools": len(list(mcp.list_tools())),
+                    "resources": len(list(mcp.list_resources())),
+                    "prompts": len(list(mcp.list_prompts()))
+                }
+            except Exception as e:
+                self.logger.error(f"Error getting capabilities for {server_id}: {e}")
+```
+
+## 4. **Example Usage with New Consistent API**
+
+```python
+# Example of using the new consistent API
+
+from mcp_hub.loaders import load_server_with_retry
+from mcp_hub.config import ServerConfig
+
+async def example_usage():
+    # Create server config
+    config = ServerConfig(
+        id="test-server",
+        name="Test Server",
+        openapi_url="https://api.example.com/openapi.json",
+        base_url="https://api.example.com",
+        retry_attempts=3,
+        retry_delay=2.0
+    )
+    
+    # Load server - returns LoadResult consistently
+    result = await load_server_with_retry(config)
+    
+    if result.success:
+        print(f"Server loaded successfully at {result.loaded_at}")
+        print(f"Connection info: {result.connection_info}")
+        
+        # Access the app and MCP instance
+        app = result.app
+        mcp = result.mcp_instance
+        
+        # Clean up when done
+        if result.cleanup_func:
+            await result.cleanup_func()
+    else:
+        print(f"Failed to load server: {result.error}")
+```
+
+## 5. **Migration Guide for Existing Code**
+
+If you have existing code using the old tuple return format:
+
+```python
+# Old code:
+mcp, app, error = await load_server_with_retry(config)
+if app:
+    # success
+else:
+    # handle error
+
+# New code:
+result = await load_server_with_retry(config)
+if result.success:
+    mcp = result.mcp_instance
+    app = result.app
+    # success
+else:
+    error = result.error
+    # handle error
+
+# Or use the legacy wrapper during migration:
+mcp, app, error = await load_server_with_retry_legacy(config)
+```
+
+## Key Benefits:
+
+1. **Consistent API**: All loaders and factory functions return `LoadResult`
+2. **Rich Metadata**: `LoadResult` carries more information (timestamps, connection info, cleanup functions)
+3. **Better Error Handling**: Errors are part of the result object, not separate returns
+4. **Resource Management**: Cleanup functions are tracked and called properly
+5. **Type Safety**: Better type hints and IDE support
+6. **Backward Compatibility**: Legacy wrapper available for gradual migration
+
+This makes the codebase more maintainable and provides a cleaner, more consistent API throughout the loader system!
