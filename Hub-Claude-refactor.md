@@ -414,3 +414,378 @@ class UVXServerLoader(ServerLoader):
 ```
 
 This refactoring provides a clean, extensible structure while maintaining compatibility with your existing code. The loader pattern makes it easy to add new server types without modifying the core logic.
+
+
+
+Absolutely! Let's refactor those repeated code blocks into a cleaner solution. Here's the refactored `load_all_servers` method:
+
+```python
+# mcp_hub/server.py
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from typing import List, Dict, Optional, Union, Tuple
+from datetime import datetime
+
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse
+import uvicorn
+
+from .config import Config
+from .registry import MCPRegistry, ServerInfo, ServerStatus
+from .loaders import load_server_with_retry, create_fallback_app, LoadResult
+
+logger = logging.getLogger(__name__)
+
+
+class MCPHub:
+    """Main MCP Hub server that hosts multiple MCP servers"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.registry = MCPRegistry()
+        self.logger = logging.getLogger(__name__)
+        
+        # Configure logging
+        logging.basicConfig(
+            level=getattr(logging, config.hub.log_level.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+    
+    def _handle_server_failure(self, 
+                             server_config, 
+                             error: str, 
+                             exception: Optional[Exception] = None) -> Starlette:
+        """Handle server loading failure and return fallback app"""
+        # Log the error
+        if exception:
+            self.logger.error(f"Server '{server_config.id}': {error}", exc_info=exception)
+        else:
+            self.logger.error(f"Server '{server_config.id}': {error}")
+        
+        # Create fallback app
+        app = create_fallback_app(server_config.id, server_config.name, error)
+        
+        # Update registry
+        info = self.registry.get(server_config.id)
+        if info:
+            info.status = ServerStatus.FAILED
+            info.error = error
+            info.app = app
+        
+        return app
+    
+    def _handle_server_success(self, 
+                             server_config, 
+                             result: LoadResult) -> Starlette:
+        """Handle successful server loading"""
+        info = self.registry.get(server_config.id)
+        
+        # Update registry with success info
+        info.mcp_instance = result.mcp_instance
+        info.app = result.app
+        info.status = ServerStatus.HEALTHY
+        info.loaded_at = result.loaded_at
+        info.connection_info = result.connection_info
+        
+        # Store cleanup function if provided
+        if result.cleanup_func:
+            info.cleanup_func = result.cleanup_func
+        
+        # Update capabilities if MCP instance available
+        if result.mcp_instance:
+            self.registry.update_capabilities(server_config.id, result.mcp_instance)
+        
+        self.logger.info(f"Server '{server_config.id}' loaded successfully")
+        
+        return result.app
+    
+    async def _load_single_server(self, server_config) -> Tuple[ServerConfig, Union[LoadResult, Exception]]:
+        """Load a single server and return the result or exception"""
+        try:
+            result = await load_server_with_retry(server_config)
+            return server_config, result
+        except Exception as e:
+            return server_config, e
+    
+    async def load_all_servers(self) -> tuple:
+        """Load all configured servers concurrently"""
+        routes = []
+        apps = []
+        
+        # First pass: Register all servers
+        active_configs = []
+        
+        for server_config in self.config.servers:
+            if not server_config.enabled:
+                self.logger.info(f"Server '{server_config.id}' is disabled")
+                self.registry.register(ServerInfo(
+                    id=server_config.id,
+                    name=server_config.name,
+                    status=ServerStatus.DISABLED,
+                    mount_path=server_config.mount_path
+                ))
+                continue
+            
+            # Register as loading
+            self.registry.register(ServerInfo(
+                id=server_config.id,
+                name=server_config.name,
+                status=ServerStatus.LOADING,
+                mount_path=server_config.mount_path
+            ))
+            
+            active_configs.append(server_config)
+        
+        # Load all active servers concurrently
+        if active_configs:
+            # Create tasks for all active servers
+            tasks = [self._load_single_server(config) for config in active_configs]
+            
+            # Wait for all to complete
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            
+            # Process results
+            for server_config, result in results:
+                app = None
+                
+                if isinstance(result, Exception):
+                    # Unexpected exception during loading
+                    app = self._handle_server_failure(
+                        server_config,
+                        f"Unexpected error: {str(result)}",
+                        result
+                    )
+                
+                elif isinstance(result, LoadResult):
+                    if result.success and result.app:
+                        # Success
+                        app = self._handle_server_success(server_config, result)
+                    else:
+                        # LoadResult indicates failure
+                        app = self._handle_server_failure(
+                            server_config,
+                            result.error or "Unknown error"
+                        )
+                
+                else:
+                    # Unexpected result type
+                    app = self._handle_server_failure(
+                        server_config,
+                        f"Unexpected result type: {type(result)}"
+                    )
+                
+                # Mount the app (fallback or real)
+                routes.append(Mount(server_config.mount_path, app=app))
+                apps.append(app)
+        
+        return routes, apps
+    
+    def create_lifespan(self, apps: List[Starlette]):
+        """Create combined lifespan for all apps with cleanup"""
+        
+        @asynccontextmanager
+        async def lifespan(app):
+            # Startup
+            self.logger.info(f"Starting {self.config.hub.name}...")
+            yield
+            
+            # Shutdown - run all cleanup functions
+            self.logger.info(f"Shutting down {self.config.hub.name}...")
+            
+            # Clean up all servers
+            cleanup_tasks = []
+            for server_id, info in self.registry.get_all().items():
+                if hasattr(info, 'cleanup_func') and info.cleanup_func:
+                    self.logger.info(f"Cleaning up server '{server_id}'...")
+                    cleanup_tasks.append(self._safe_cleanup(server_id, info.cleanup_func))
+            
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        
+        return lifespan
+    
+    async def _safe_cleanup(self, server_id: str, cleanup_func):
+        """Safely execute cleanup function"""
+        try:
+            await cleanup_func()
+        except Exception as e:
+            self.logger.error(f"Error during cleanup of server '{server_id}': {e}")
+    
+    async def create_app(self) -> Starlette:
+        """Create the main Starlette application"""
+        # Load all servers
+        routes, apps = await self.load_all_servers()
+        
+        # Add hub API routes
+        api_routes = [
+            Route("/health", self.health_endpoint),
+            Route("/api/servers", self.list_servers_endpoint),
+            Route("/api/servers/{server_id}", self.get_server_endpoint),
+        ]
+        
+        # Combine all routes
+        all_routes = api_routes + routes
+        
+        # Create main app
+        app = Starlette(
+            routes=all_routes,
+            lifespan=self.create_lifespan(apps)
+        )
+        
+        return app
+    
+    # ... rest of MCPHub implementation (endpoints, etc.) ...
+```
+
+## Alternative Approach with Result Handler Class
+
+If you want even more separation of concerns, you could create a dedicated result handler:
+
+```python
+# mcp_hub/server_loader_handler.py
+
+from typing import Optional, Union
+from datetime import datetime
+import logging
+
+from starlette.applications import Starlette
+
+from .registry import MCPRegistry, ServerStatus
+from .loaders import LoadResult, create_fallback_app
+from .config import ServerConfig
+
+logger = logging.getLogger(__name__)
+
+
+class ServerLoadResultHandler:
+    """Handles the results of server loading operations"""
+    
+    def __init__(self, registry: MCPRegistry):
+        self.registry = registry
+    
+    def handle_result(self, 
+                     server_config: ServerConfig,
+                     result: Union[LoadResult, Exception]) -> Starlette:
+        """Process a server load result and return the appropriate app"""
+        
+        if isinstance(result, Exception):
+            return self._handle_exception(server_config, result)
+        
+        elif isinstance(result, LoadResult):
+            if result.success and result.app:
+                return self._handle_success(server_config, result)
+            else:
+                return self._handle_load_failure(server_config, result)
+        
+        else:
+            return self._handle_unexpected_result(server_config, result)
+    
+    def _handle_success(self, server_config: ServerConfig, result: LoadResult) -> Starlette:
+        """Handle successful server loading"""
+        info = self.registry.get(server_config.id)
+        
+        # Update registry
+        info.mcp_instance = result.mcp_instance
+        info.app = result.app
+        info.status = ServerStatus.HEALTHY
+        info.loaded_at = result.loaded_at
+        info.connection_info = result.connection_info
+        
+        if result.cleanup_func:
+            info.cleanup_func = result.cleanup_func
+        
+        # Update capabilities
+        if result.mcp_instance:
+            self.registry.update_capabilities(server_config.id, result.mcp_instance)
+        
+        logger.info(f"Server '{server_config.id}' loaded successfully")
+        return result.app
+    
+    def _handle_exception(self, server_config: ServerConfig, exception: Exception) -> Starlette:
+        """Handle unexpected exception during loading"""
+        error_msg = f"Unexpected error: {str(exception)}"
+        logger.error(f"Server '{server_config.id}': {error_msg}", exc_info=exception)
+        
+        return self._create_and_register_fallback(server_config, error_msg)
+    
+    def _handle_load_failure(self, server_config: ServerConfig, result: LoadResult) -> Starlette:
+        """Handle LoadResult that indicates failure"""
+        error_msg = result.error or "Unknown error"
+        logger.error(f"Server '{server_config.id}' failed: {error_msg}")
+        
+        return self._create_and_register_fallback(server_config, error_msg)
+    
+    def _handle_unexpected_result(self, server_config: ServerConfig, result: any) -> Starlette:
+        """Handle unexpected result type"""
+        error_msg = f"Unexpected result type: {type(result)}"
+        logger.error(f"Server '{server_config.id}': {error_msg}")
+        
+        return self._create_and_register_fallback(server_config, error_msg)
+    
+    def _create_and_register_fallback(self, server_config: ServerConfig, error: str) -> Starlette:
+        """Create fallback app and update registry"""
+        app = create_fallback_app(server_config.id, server_config.name, error)
+        
+        info = self.registry.get(server_config.id)
+        if info:
+            info.status = ServerStatus.FAILED
+            info.error = error
+            info.app = app
+        
+        return app
+```
+
+Then use it in MCPHub:
+
+```python
+class MCPHub:
+    def __init__(self, config: Config):
+        self.config = config
+        self.registry = MCPRegistry()
+        self.result_handler = ServerLoadResultHandler(self.registry)
+        # ... rest of init ...
+    
+    async def load_all_servers(self) -> tuple:
+        """Load all configured servers concurrently"""
+        routes = []
+        apps = []
+        
+        # Filter and register servers
+        active_configs = []
+        for server_config in self.config.servers:
+            if not server_config.enabled:
+                self.logger.info(f"Server '{server_config.id}' is disabled")
+                self.registry.register(ServerInfo(
+                    id=server_config.id,
+                    name=server_config.name,
+                    status=ServerStatus.DISABLED,
+                    mount_path=server_config.mount_path
+                ))
+                continue
+            
+            self.registry.register(ServerInfo(
+                id=server_config.id,
+                name=server_config.name,
+                status=ServerStatus.LOADING,
+                mount_path=server_config.mount_path
+            ))
+            active_configs.append(server_config)
+        
+        # Load all active servers
+        if active_configs:
+            tasks = [self._load_single_server(config) for config in active_configs]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            
+            # Process results using the handler
+            for server_config, result in results:
+                app = self.result_handler.handle_result(server_config, result)
+                routes.append(Mount(server_config.mount_path, app=app))
+                apps.append(app)
+        
+        return routes, apps
+```
+
+Both approaches eliminate the code duplication and make the error handling logic much more maintainable. The first approach keeps everything in the MCPHub class with helper methods, while the second approach separates the concern into a dedicated handler class. Choose based on your preference for code organization!
