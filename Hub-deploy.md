@@ -453,3 +453,533 @@ This deployment setup allows the MCP Hub to be used by:
 - Any MCP-compatible client
 
 The hub acts as a central gateway to all your MCP servers, regardless of their underlying implementation (OpenAPI, UVX, NPM, etc.).
+
+
+
+Excellent question! Let's implement a secure way to handle secrets in the server configuration. Here are several approaches:
+
+## 1. **Environment Variable Substitution (Already Partially Implemented)**
+
+Enhance the existing `substitute_env_vars` function in `config.py`:
+
+```python
+# mcp_hub/config.py
+
+import os
+import re
+import yaml
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field, validator
+
+
+def substitute_env_vars(data: Any) -> Any:
+    """Recursively substitute ${VAR} and ${VAR:-default} with environment variables"""
+    if isinstance(data, dict):
+        return {k: substitute_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [substitute_env_vars(item) for item in data]
+    elif isinstance(data, str):
+        def replacer(match):
+            var_expr = match.group(1)
+            # Handle ${VAR:-default} syntax
+            if ':-' in var_expr:
+                var_name, default_value = var_expr.split(':-', 1)
+                return os.environ.get(var_name.strip(), default_value)
+            else:
+                var_name = var_expr.strip()
+                value = os.environ.get(var_name)
+                if value is None:
+                    # Check if it's a required var (no default)
+                    raise ValueError(f"Required environment variable '{var_name}' is not set")
+                return value
+        
+        # Support both ${VAR} and $VAR syntax
+        pattern = r'\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)'
+        
+        def full_replacer(match):
+            if match.group(1):  # ${VAR} style
+                return replacer(match)
+            else:  # $VAR style
+                var_name = match.group(2)
+                return os.environ.get(var_name, match.group(0))
+        
+        return re.sub(pattern, full_replacer, data)
+    else:
+        return data
+```
+
+Usage in `servers.yaml`:
+
+```yaml
+servers:
+  - id: "atlassian-server"
+    name: "Atlassian MCP"
+    packages:
+      - registry_name: "uvx"
+        name: "mcp-atlassian"
+        environment_variables:
+          - name: "JIRA_URL"
+            default: "${JIRA_URL}"
+          - name: "JIRA_API_TOKEN"
+            default: "${JIRA_API_TOKEN}"  # From environment
+          - name: "CONFLUENCE_URL"
+            default: "${CONFLUENCE_URL:-https://default.atlassian.net/wiki}"  # With default
+```
+
+## 2. **Secrets File Approach**
+
+Create a separate secrets management system:
+
+```python
+# mcp_hub/secrets.py
+
+import os
+import json
+import yaml
+from pathlib import Path
+from typing import Dict, Any, Optional
+from cryptography.fernet import Fernet
+import keyring
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SecretsManager:
+    """Manage secrets for MCP Hub servers"""
+    
+    def __init__(self, secrets_dir: Optional[Path] = None):
+        self.secrets_dir = secrets_dir or self._get_secrets_dir()
+        self.secrets_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: Dict[str, Any] = {}
+    
+    def _get_secrets_dir(self) -> Path:
+        """Get platform-specific secrets directory"""
+        if os.name == 'nt':  # Windows
+            base = Path(os.environ.get('APPDATA', '~'))
+        else:  # Unix-like
+            base = Path.home() / '.config'
+        
+        return base / 'mcp-hub' / 'secrets'
+    
+    def load_secrets(self, server_id: str) -> Dict[str, Any]:
+        """Load secrets for a specific server"""
+        # Check multiple sources in order of precedence
+        secrets = {}
+        
+        # 1. Environment variables prefixed with server ID
+        prefix = f"MCP_{server_id.upper().replace('-', '_')}_"
+        for key, value in os.environ.items():
+            if key.startswith(prefix):
+                secret_name = key[len(prefix):].lower()
+                secrets[secret_name] = value
+        
+        # 2. Secrets file (JSON or YAML)
+        secrets_file = self.secrets_dir / f"{server_id}.secrets.yaml"
+        if secrets_file.exists():
+            with open(secrets_file, 'r') as f:
+                file_secrets = yaml.safe_load(f)
+                secrets.update(file_secrets or {})
+        
+        # 3. System keyring (for sensitive data)
+        try:
+            keyring_secrets = keyring.get_password("mcp-hub", server_id)
+            if keyring_secrets:
+                secrets.update(json.loads(keyring_secrets))
+        except Exception as e:
+            logger.debug(f"Could not load from keyring: {e}")
+        
+        return secrets
+    
+    def save_secret(self, server_id: str, key: str, value: str, use_keyring: bool = False):
+        """Save a secret for a server"""
+        if use_keyring:
+            # Store in system keyring
+            current = {}
+            try:
+                stored = keyring.get_password("mcp-hub", server_id)
+                if stored:
+                    current = json.loads(stored)
+            except:
+                pass
+            
+            current[key] = value
+            keyring.set_password("mcp-hub", server_id, json.dumps(current))
+        else:
+            # Store in secrets file
+            secrets_file = self.secrets_dir / f"{server_id}.secrets.yaml"
+            secrets = {}
+            
+            if secrets_file.exists():
+                with open(secrets_file, 'r') as f:
+                    secrets = yaml.safe_load(f) or {}
+            
+            secrets[key] = value
+            
+            with open(secrets_file, 'w') as f:
+                yaml.dump(secrets, f, default_flow_style=False)
+            
+            # Set restrictive permissions on Unix-like systems
+            if os.name != 'nt':
+                os.chmod(secrets_file, 0o600)
+
+
+class SecureServerConfig(BaseModel):
+    """Extended server config with secrets support"""
+    # ... existing fields ...
+    
+    secrets_required: Optional[List[str]] = Field(default_factory=list)
+    secrets_optional: Optional[List[str]] = Field(default_factory=list)
+    
+    def resolve_secrets(self, secrets_manager: SecretsManager):
+        """Resolve secrets for this server configuration"""
+        secrets = secrets_manager.load_secrets(self.id)
+        
+        # Check required secrets
+        missing = []
+        for required in self.secrets_required:
+            if required not in secrets:
+                missing.append(required)
+        
+        if missing:
+            raise ValueError(f"Missing required secrets for {self.id}: {', '.join(missing)}")
+        
+        # Apply secrets to configuration
+        self._apply_secrets(secrets)
+    
+    def _apply_secrets(self, secrets: Dict[str, Any]):
+        """Apply secrets to the configuration"""
+        # This is where you'd inject secrets into the appropriate fields
+        # For example, into environment_variables
+        if hasattr(self, 'packages'):
+            for package in self.packages:
+                for env_var in package.environment_variables:
+                    if env_var.name.lower() in secrets:
+                        env_var.default = secrets[env_var.name.lower()]
+```
+
+## 3. **Secrets Configuration File**
+
+Create a `.secrets.yaml` file structure:
+
+```yaml
+# data/.secrets.yaml (git-ignored)
+servers:
+  atlassian-server:
+    jira_api_token: "your-actual-token-here"
+    confluence_api_token: "another-token"
+    oauth_client_secret: "secret-value"
+  
+  github-server:
+    github_token: "ghp_xxxxxxxxxxxxx"
+    webhook_secret: "webhook-secret-value"
+
+# Encrypted version (optional)
+encrypted: true
+encryption_key: "${SECRETS_ENCRYPTION_KEY}"
+```
+
+## 4. **CLI Commands for Secrets Management**
+
+Add secret management commands to `cli.py`:
+
+```python
+# mcp_hub/cli.py
+
+@cli.group()
+def secrets():
+    """Manage server secrets"""
+    pass
+
+
+@secrets.command()
+@click.argument('server_id')
+@click.argument('key')
+@click.option('--value', prompt=True, hide_input=True, confirmation_prompt=True)
+@click.option('--keyring', is_flag=True, help='Store in system keyring')
+@click.pass_context
+def set(ctx, server_id: str, key: str, value: str, keyring: bool):
+    """Set a secret for a server"""
+    secrets_manager = SecretsManager()
+    secrets_manager.save_secret(server_id, key, value, use_keyring=keyring)
+    click.echo(f"Secret '{key}' set for server '{server_id}'")
+
+
+@secrets.command()
+@click.argument('server_id')
+@click.pass_context
+def list(ctx, server_id: str):
+    """List secrets for a server (keys only)"""
+    secrets_manager = SecretsManager()
+    secrets = secrets_manager.load_secrets(server_id)
+    
+    if secrets:
+        click.echo(f"Secrets for {server_id}:")
+        for key in sorted(secrets.keys()):
+            click.echo(f"  - {key}")
+    else:
+        click.echo(f"No secrets found for {server_id}")
+
+
+@secrets.command()
+@click.argument('server_id')
+@click.argument('key')
+@click.pass_context
+def delete(ctx, server_id: str, key: str):
+    """Delete a secret"""
+    if click.confirm(f"Delete secret '{key}' for server '{server_id}'?"):
+        secrets_manager = SecretsManager()
+        # Implementation depends on storage method
+        click.echo(f"Secret '{key}' deleted")
+
+
+@secrets.command()
+@click.option('--server', '-s', help='Import secrets for specific server')
+@click.argument('file', type=click.Path(exists=True))
+@click.pass_context
+def import_file(ctx, server: Optional[str], file: str):
+    """Import secrets from file"""
+    with open(file, 'r') as f:
+        if file.endswith('.json'):
+            data = json.load(f)
+        else:
+            data = yaml.safe_load(f)
+    
+    secrets_manager = SecretsManager()
+    
+    if server:
+        # Import for specific server
+        for key, value in data.items():
+            secrets_manager.save_secret(server, key, str(value))
+        click.echo(f"Imported {len(data)} secrets for {server}")
+    else:
+        # Import for multiple servers
+        for server_id, secrets in data.get('servers', {}).items():
+            for key, value in secrets.items():
+                secrets_manager.save_secret(server_id, key, str(value))
+            click.echo(f"Imported {len(secrets)} secrets for {server_id}")
+```
+
+## 5. **External Secret Providers**
+
+Support for external secret management systems:
+
+```python
+# mcp_hub/secrets/providers.py
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional
+import os
+import boto3
+import hvac
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+
+
+class SecretProvider(ABC):
+    """Base class for secret providers"""
+    
+    @abstractmethod
+    async def get_secret(self, key: str) -> Optional[str]:
+        pass
+    
+    @abstractmethod
+    async def set_secret(self, key: str, value: str) -> bool:
+        pass
+
+
+class AWSSecretsProvider(SecretProvider):
+    """AWS Secrets Manager provider"""
+    
+    def __init__(self, region: str = None):
+        self.client = boto3.client(
+            'secretsmanager',
+            region_name=region or os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+        )
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        try:
+            response = self.client.get_secret_value(SecretId=key)
+            return response['SecretString']
+        except Exception:
+            return None
+
+
+class HashiCorpVaultProvider(SecretProvider):
+    """HashiCorp Vault provider"""
+    
+    def __init__(self, url: str = None, token: str = None):
+        self.client = hvac.Client(
+            url=url or os.environ.get('VAULT_ADDR'),
+            token=token or os.environ.get('VAULT_TOKEN')
+        )
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        try:
+            response = self.client.secrets.kv.v2.read_secret_version(
+                path=key
+            )
+            return response['data']['data'].get('value')
+        except Exception:
+            return None
+
+
+class AzureKeyVaultProvider(SecretProvider):
+    """Azure Key Vault provider"""
+    
+    def __init__(self, vault_url: str = None):
+        self.vault_url = vault_url or os.environ.get('AZURE_KEY_VAULT_URL')
+        credential = DefaultAzureCredential()
+        self.client = SecretClient(vault_url=self.vault_url, credential=credential)
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        try:
+            secret = self.client.get_secret(key)
+            return secret.value
+        except Exception:
+            return None
+
+
+# Provider factory
+def get_secret_provider(provider_type: str) -> SecretProvider:
+    providers = {
+        'aws': AWSSecretsProvider,
+        'vault': HashiCorpVaultProvider,
+        'azure': AzureKeyVaultProvider,
+    }
+    
+    provider_class = providers.get(provider_type)
+    if not provider_class:
+        raise ValueError(f"Unknown secret provider: {provider_type}")
+    
+    return provider_class()
+```
+
+## 6. **Updated servers.yaml with Secrets References**
+
+```yaml
+servers:
+  - id: "atlassian-server"
+    name: "Atlassian MCP"
+    secrets_required:
+      - "jira_api_token"
+      - "confluence_api_token"
+    secrets_optional:
+      - "oauth_client_secret"
+    packages:
+      - registry_name: "uvx"
+        name: "mcp-atlassian"
+        environment_variables:
+          - name: "JIRA_URL"
+            default: "https://company.atlassian.net"
+          - name: "JIRA_API_TOKEN"
+            secret_ref: "jira_api_token"  # Reference to secret
+          - name: "CONFLUENCE_API_TOKEN"
+            secret_ref: "confluence_api_token"
+
+  - id: "github-api"
+    name: "GitHub API"
+    type: "openapi"
+    openapi_url: "https://api.github.com/openapi.yaml"
+    auth_type: "bearer"
+    auth_token_secret: "github_token"  # Reference to secret
+    secrets_required:
+      - "github_token"
+```
+
+## 7. **Docker Secrets Support**
+
+For Docker deployments, use Docker secrets:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  mcp-hub:
+    build: .
+    secrets:
+      - jira_api_token
+      - confluence_api_token
+      - github_token
+    environment:
+      - SECRETS_PATH=/run/secrets
+    volumes:
+      - ./data:/app/data
+
+secrets:
+  jira_api_token:
+    external: true
+  confluence_api_token:
+    external: true
+  github_token:
+    external: true
+```
+
+## 8. **Best Practices Implementation**
+
+```python
+# mcp_hub/config.py - Enhanced Config class
+
+class Config(BaseModel):
+    hub: HubConfig = Field(default_factory=HubConfig)
+    servers: List[ServerConfig] = Field(default_factory=list)
+    secrets_provider: Optional[str] = None  # aws, vault, azure, local
+    
+    @classmethod
+    def from_file(cls, config_path: str | Path, servers_path: Optional[str | Path] = None) -> "Config":
+        """Load configuration from YAML files with secrets resolution"""
+        # Load configuration files
+        config_path = Path(config_path)
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        if servers_path:
+            servers_path = Path(servers_path)
+            if servers_path.exists():
+                with open(servers_path, 'r') as f:
+                    servers_data = yaml.safe_load(f)
+                    config_data['servers'] = servers_data.get('servers', [])
+        
+        # Substitute environment variables first
+        config_data = substitute_env_vars(config_data)
+        
+        # Create config instance
+        config = cls(**config_data)
+        
+        # Resolve secrets for each server
+        secrets_manager = SecretsManager()
+        for server in config.servers:
+            try:
+                server.resolve_secrets(secrets_manager)
+            except ValueError as e:
+                logger.warning(f"Could not resolve secrets for {server.id}: {e}")
+        
+        return config
+```
+
+## Usage Examples:
+
+```bash
+# Set secrets via CLI
+mcp-hub secrets set atlassian-server jira_api_token
+mcp-hub secrets set atlassian-server confluence_api_token --keyring
+
+# Import secrets from file
+mcp-hub secrets import-file secrets.yaml
+
+# Use environment variables
+export MCP_ATLASSIAN_SERVER_JIRA_API_TOKEN="your-token"
+export MCP_ATLASSIAN_SERVER_CONFLUENCE_API_TOKEN="your-token"
+
+# Run with secrets
+mcp-hub run
+```
+
+This approach provides:
+1. **Multiple secret sources**: Environment variables, files, keyring, external providers
+2. **Security**: Secrets never appear in configuration files
+3. **Flexibility**: Different secret management per environment
+4. **Auditability**: Track which secrets are required
+5. **Developer-friendly**: Easy CLI for secret management
