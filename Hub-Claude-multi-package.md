@@ -826,3 +826,662 @@ This design allows you to:
 - Configure transport-specific settings in servers.yaml
 - Handle authentication headers for multi-tenant scenarios
 - Support both process-based (stdio) and HTTP-based (SSE, streamable-http) transports
+
+
+
+Looking at FastMCP's proxy capabilities, you're absolutely right! FastMCP already has excellent proxy support built-in. Let me refactor the loaders to use FastMCP's native proxy features instead of reinventing the wheel:
+
+## 1. **Updated loaders/uvx.py** (Using FastMCP Proxy)
+
+```python
+import asyncio
+import sys
+import time
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+from starlette.applications import Starlette
+
+from .base import ServerLoader, LoadResult
+from ..models.server import TransportType, TransportConfig
+from ..config import ServerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class UVXServerLoader(ServerLoader):
+    """Loader for Python packages via uvx using FastMCP proxy"""
+    
+    async def load(self, config: ServerConfig) -> LoadResult:
+        # Find uvx package configuration
+        uvx_package = None
+        for package in config.packages:
+            if package.registry_name == "uvx":
+                uvx_package = package
+                break
+        
+        if not uvx_package:
+            return LoadResult(
+                success=False,
+                error="No uvx package configuration found"
+            )
+        
+        try:
+            transport = uvx_package.transport
+            
+            # Build the command to run the UVX server
+            cmd = self._build_uvx_command(uvx_package)
+            
+            # Prepare environment
+            env = self._prepare_environment(uvx_package)
+            
+            if transport.type == TransportType.STDIO:
+                # For stdio transport, use the command directly
+                proxy_client = ProxyClient(cmd, env=env)
+            else:
+                # For HTTP-based transports, start the server and connect via URL
+                process = await self._start_http_server(cmd, env, transport)
+                
+                # Build the URL for the HTTP server
+                url = await self._get_http_url(transport)
+                
+                # Create proxy client for the HTTP endpoint
+                proxy_client = ProxyClient(url)
+                
+                # Store process for cleanup
+                self._process = process
+            
+            # Create a FastMCP proxy server
+            proxy_server = FastMCP.as_proxy(
+                proxy_client,
+                name=f"{config.name} (Proxy)"
+            )
+            
+            # Get the ASGI app from the proxy
+            app = proxy_server.get_asgi_app()
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=proxy_server,
+                app=app,
+                connection_info={
+                    "type": "proxy",
+                    "backend_transport": transport.type,
+                    "proxy_client": proxy_client
+                },
+                loaded_at=datetime.utcnow(),
+                cleanup_func=self._create_cleanup_func()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load uvx package: {e}")
+            return LoadResult(
+                success=False,
+                error=f"Failed to load uvx package: {str(e)}"
+            )
+    
+    def _build_uvx_command(self, package) -> List[str]:
+        """Build the uvx command line"""
+        cmd = ["uvx"]
+        
+        # Add any uvx-specific options
+        if package.uvx_options:
+            cmd.extend(package.uvx_options)
+        
+        # Add package name with optional version
+        if package.version and package.version != "latest":
+            cmd.append(f"{package.name}=={package.version}")
+        else:
+            cmd.append(package.name)
+        
+        # Add entry point if specified
+        if package.entry_point:
+            cmd.append(package.entry_point)
+        
+        # Add transport configuration
+        transport = package.transport
+        if transport.type != TransportType.STDIO:
+            cmd.extend(["--transport", transport.type])
+            if transport.port:
+                cmd.extend(["--port", str(transport.port)])
+            cmd.extend(transport.extra_args)
+        
+        # Add package arguments
+        for arg in package.package_arguments:
+            if arg.type == "positional":
+                cmd.append(arg.value)
+            else:
+                cmd.append(f"--{arg.name}")
+                if arg.value:
+                    cmd.append(arg.value)
+        
+        return cmd
+    
+    def _prepare_environment(self, package) -> Dict[str, str]:
+        """Prepare environment variables"""
+        import os
+        env = os.environ.copy()
+        
+        for env_var in package.environment_variables:
+            value = os.getenv(env_var.name, env_var.default)
+            if value:
+                env[env_var.name] = value
+            elif env_var.required:
+                raise ValueError(f"Required environment variable {env_var.name} not set")
+        
+        return env
+    
+    async def _start_http_server(self, cmd: List[str], env: Dict[str, str], 
+                                transport: TransportConfig) -> asyncio.subprocess.Process:
+        """Start HTTP-based server and return process"""
+        logger.info(f"Starting HTTP server: {' '.join(cmd)}")
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Wait for server to be ready
+        await self._wait_for_http_ready(transport)
+        
+        return process
+    
+    async def _wait_for_http_ready(self, transport: TransportConfig, timeout: float = 30.0):
+        """Wait for HTTP server to be ready"""
+        import httpx
+        
+        host = transport.host or "127.0.0.1"
+        port = transport.port or 9000
+        url = f"http://{host}:{port}"
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.get(url, timeout=2.0)
+                    logger.info(f"HTTP server ready at {url}")
+                    return
+            except:
+                await asyncio.sleep(0.5)
+        
+        raise RuntimeError(f"HTTP server failed to start within {timeout}s")
+    
+    async def _get_http_url(self, transport: TransportConfig) -> str:
+        """Get the full URL for the HTTP server"""
+        host = transport.host or "127.0.0.1"
+        port = transport.port or 9000
+        
+        if transport.type == TransportType.SSE:
+            endpoint = transport.endpoint or "/sse"
+        elif transport.type == TransportType.STREAMABLE_HTTP:
+            endpoint = transport.endpoint or "/mcp"
+        else:
+            endpoint = transport.endpoint or "/"
+        
+        return f"http://{host}:{port}{endpoint}"
+    
+    def _create_cleanup_func(self):
+        """Create cleanup function"""
+        async def cleanup():
+            if hasattr(self, '_process') and self._process:
+                if self._process.returncode is None:
+                    logger.info(f"Terminating process {self._process.pid}")
+                    self._process.terminate()
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Force killing process {self._process.pid}")
+                        self._process.kill()
+                        await self._process.wait()
+        
+        return cleanup
+```
+
+## 2. **Simplified loaders/npm.py** (Using FastMCP Proxy)
+
+```python
+import asyncio
+import json
+from typing import Dict, Any
+from datetime import datetime
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from .base import ServerLoader, LoadResult
+from ..models.server import TransportType
+from ..config import ServerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class NPMServerLoader(ServerLoader):
+    """Loader for NPM-based MCP servers using FastMCP proxy"""
+    
+    async def load(self, config: ServerConfig) -> LoadResult:
+        # Find npm package configuration
+        npm_package = None
+        for package in config.packages:
+            if package.registry_name == "npm":
+                npm_package = package
+                break
+        
+        if not npm_package:
+            return LoadResult(
+                success=False,
+                error="No npm package configuration found"
+            )
+        
+        try:
+            # Install package first
+            if not await self._install_package(npm_package):
+                return LoadResult(
+                    success=False,
+                    error="Failed to install npm package"
+                )
+            
+            # Build command
+            cmd = self._build_npm_command(npm_package)
+            
+            # Prepare environment
+            env = self._prepare_environment(npm_package)
+            
+            transport = npm_package.transport
+            
+            if transport.type == TransportType.STDIO:
+                # Direct stdio proxy
+                proxy_client = ProxyClient(cmd, env=env)
+            else:
+                # Start HTTP server and proxy to it
+                process = await self._start_http_server(cmd, env, transport)
+                url = self._get_http_url(transport)
+                proxy_client = ProxyClient(url)
+                self._process = process
+            
+            # Create FastMCP proxy
+            proxy_server = FastMCP.as_proxy(
+                proxy_client,
+                name=f"{config.name} (NPM Proxy)"
+            )
+            
+            app = proxy_server.get_asgi_app()
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=proxy_server,
+                app=app,
+                connection_info={
+                    "type": "proxy",
+                    "backend_transport": transport.type,
+                    "package": npm_package.name
+                },
+                loaded_at=datetime.utcnow(),
+                cleanup_func=self._create_cleanup_func()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load npm package: {e}")
+            return LoadResult(
+                success=False,
+                error=f"Failed to load npm package: {str(e)}"
+            )
+    
+    async def _install_package(self, package) -> bool:
+        """Install NPM package if needed"""
+        # Check if already installed
+        check_cmd = ["npm", "list", "-g", package.name, "--json"]
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await proc.communicate()
+            
+            if proc.returncode == 0:
+                data = json.loads(stdout)
+                if package.name in data.get("dependencies", {}):
+                    logger.info(f"NPM package {package.name} already installed")
+                    return True
+        except:
+            pass
+        
+        # Install the package
+        install_cmd = ["npm", "install", "-g"]
+        if package.version and package.version != "latest":
+            install_cmd.append(f"{package.name}@{package.version}")
+        else:
+            install_cmd.append(package.name)
+        
+        logger.info(f"Installing NPM package: {' '.join(install_cmd)}")
+        
+        proc = await asyncio.create_subprocess_exec(
+            *install_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        await proc.communicate()
+        return proc.returncode == 0
+    
+    def _build_npm_command(self, package) -> List[str]:
+        """Build NPM command"""
+        cmd = ["npx", package.name]
+        
+        if package.entry_point:
+            cmd.append(package.entry_point)
+        
+        # Add transport args for non-stdio
+        transport = package.transport
+        if transport.type != TransportType.STDIO:
+            if transport.type == TransportType.SSE:
+                cmd.extend(["--transport", "sse"])
+            elif transport.type == TransportType.STREAMABLE_HTTP:
+                cmd.extend(["--transport", "streamable-http"])
+            
+            if transport.port:
+                cmd.extend(["--port", str(transport.port)])
+            
+            cmd.extend(transport.extra_args)
+        
+        # Add package arguments
+        for arg in package.package_arguments:
+            if arg.type == "positional":
+                cmd.append(arg.value)
+            else:
+                cmd.append(f"--{arg.name}")
+                if arg.value:
+                    cmd.append(arg.value)
+        
+        return cmd
+    
+    # ... (reuse _prepare_environment, _start_http_server, _get_http_url, _create_cleanup_func from UVXServerLoader)
+```
+
+## 3. **Updated loaders/openapi.py** (Already using FastMCP native features)
+
+The OpenAPI loader already uses FastMCP's native `from_openapi()` method, which is perfect!
+
+## 4. **New loaders/composite.py** (For Multi-Server Configs)
+
+```python
+from typing import Dict, Any
+from datetime import datetime
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from .base import ServerLoader, LoadResult
+from ..config import ServerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class CompositeServerLoader(ServerLoader):
+    """Loader for multi-server configurations using FastMCP proxy"""
+    
+    async def load(self, config: ServerConfig) -> LoadResult:
+        """Load a composite server from MCPConfig format"""
+        
+        if not hasattr(config, 'mcp_config') or not config.mcp_config:
+            return LoadResult(
+                success=False,
+                error="No MCP configuration found"
+            )
+        
+        try:
+            # FastMCP.as_proxy() can handle MCPConfig format directly!
+            proxy_server = FastMCP.as_proxy(
+                config.mcp_config,
+                name=config.name
+            )
+            
+            app = proxy_server.get_asgi_app()
+            
+            # Extract server info from config
+            servers = config.mcp_config.get("mcpServers", {})
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=proxy_server,
+                app=app,
+                connection_info={
+                    "type": "composite",
+                    "servers": list(servers.keys()),
+                    "server_count": len(servers)
+                },
+                loaded_at=datetime.utcnow()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to create composite proxy: {e}")
+            return LoadResult(
+                success=False,
+                error=f"Failed to create composite proxy: {str(e)}"
+            )
+```
+
+## 5. **Updated servers.yaml with FastMCP Proxy Patterns**
+
+```yaml
+servers:
+  # Direct OpenAPI server (no proxy needed)
+  - id: "github-api"
+    name: "GitHub API Server"
+    type: "openapi"
+    openapi_url: "https://api.github.com/openapi.yaml"
+    base_url: "https://api.github.com"
+    mount_path: "/github"
+    enabled: true
+
+  # UVX server via proxy (stdio)
+  - id: "mcp-atlassian"
+    name: "Atlassian MCP Server"
+    mount_path: "/atlassian"
+    enabled: true
+    packages:
+      - registry_name: "uvx"
+        name: "mcp-atlassian"
+        version: "0.11.9"
+        transport:
+          type: "stdio"  # ProxyClient will handle stdio directly
+        environment_variables:
+          - name: "JIRA_URL"
+            default: "${JIRA_URL:-https://company.atlassian.net}"
+          - name: "JIRA_USERNAME"
+            default: "${JIRA_USERNAME}"
+          - name: "JIRA_API_TOKEN"
+            default: "${JIRA_API_TOKEN}"
+
+  # UVX server with HTTP transport
+  - id: "mcp-atlassian-http"
+    name: "Atlassian MCP (HTTP)"
+    mount_path: "/atlassian-http"
+    enabled: true
+    packages:
+      - registry_name: "uvx"
+        name: "mcp-atlassian"
+        transport:
+          type: "streamable-http"
+          port: 9002
+          endpoint: "/mcp"
+          headers:
+            Authorization: "Bearer ${ATLASSIAN_OAUTH_TOKEN}"
+            X-Atlassian-Cloud-Id: "${ATLASSIAN_CLOUD_ID}"
+        environment_variables:
+          - name: "ATLASSIAN_OAUTH_ENABLE"
+            default: "true"
+
+  # Composite multi-server configuration
+  - id: "ai-services"
+    name: "AI Services Composite"
+    mount_path: "/ai"
+    enabled: true
+    mcp_config:
+      mcpServers:
+        openai:
+          url: "https://openai-mcp.example.com/sse"
+          transport: "sse"
+        anthropic:
+          command: "python"
+          args: ["./anthropic_server.py"]
+        local:
+          url: "http://localhost:8000/mcp"
+
+  # Remote server proxy (transport bridging)
+  - id: "remote-weather"
+    name: "Remote Weather API"
+    mount_path: "/weather"
+    enabled: true
+    remote_proxy:
+      url: "https://weather-api.example.com/mcp/sse"
+      transport: "sse"
+      # This creates a ProxyClient internally
+```
+
+## 6. **Simplified Factory Pattern**
+
+```python
+# loaders/factory.py
+
+import logging
+from typing import Optional
+
+from .base import ServerLoader
+from .openapi import OpenAPIServerLoader
+from .module import ModuleServerLoader
+from .uvx import UVXServerLoader
+from .npm import NPMServerLoader
+from .pypi import PyPIServerLoader
+from .composite import CompositeServerLoader
+from .remote import RemoteProxyLoader
+from ..config import ServerConfig
+
+logger = logging.getLogger(__name__)
+
+
+def get_loader_for_config(config: ServerConfig) -> Optional[ServerLoader]:
+    """Get the appropriate loader based on configuration"""
+    
+    # 1. Check for composite/multi-server config
+    if hasattr(config, 'mcp_config') and config.mcp_config:
+        return CompositeServerLoader()
+    
+    # 2. Check for remote proxy config
+    if hasattr(config, 'remote_proxy') and config.remote_proxy:
+        return RemoteProxyLoader()
+    
+    # 3. Check for OpenAPI
+    if hasattr(config, 'openapi_url') and config.openapi_url:
+        return OpenAPIServerLoader()
+    
+    # 4. Check for module
+    if hasattr(config, 'module_path') and config.module_path:
+        return ModuleServerLoader()
+    
+    # 5. Check for packages
+    if hasattr(config, 'packages') and config.packages:
+        # Get loader based on first package's registry
+        registry_name = config.packages[0].registry_name
+        
+        loader_map = {
+            "uvx": UVXServerLoader,
+            "npm": NPMServerLoader,
+            "pypi": PyPIServerLoader,
+        }
+        
+        loader_class = loader_map.get(registry_name)
+        if loader_class:
+            return loader_class()
+    
+    logger.error(f"No suitable loader found for server: {config.id}")
+    return None
+```
+
+## 7. **New loaders/remote.py** (For Remote Proxies)
+
+```python
+from datetime import datetime
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from .base import ServerLoader, LoadResult
+from ..config import ServerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class RemoteProxyLoader(ServerLoader):
+    """Loader for remote MCP servers via proxy"""
+    
+    async def load(self, config: ServerConfig) -> LoadResult:
+        """Create a proxy to a remote MCP server"""
+        
+        if not hasattr(config, 'remote_proxy'):
+            return LoadResult(
+                success=False,
+                error="No remote proxy configuration found"
+            )
+        
+        try:
+            remote_config = config.remote_proxy
+            url = remote_config.get('url')
+            
+            if not url:
+                return LoadResult(
+                    success=False,
+                    error="Remote proxy URL is required"
+                )
+            
+            # Create proxy client for remote server
+            proxy_client = ProxyClient(url)
+            
+            # Create FastMCP proxy
+            proxy_server = FastMCP.as_proxy(
+                proxy_client,
+                name=f"{config.name} (Remote Proxy)"
+            )
+            
+            app = proxy_server.get_asgi_app()
+            
+            return LoadResult(
+                success=True,
+                mcp_instance=proxy_server,
+                app=app,
+                connection_info={
+                    "type": "remote_proxy",
+                    "url": url,
+                    "transport": remote_config.get('transport', 'unknown')
+                },
+                loaded_at=datetime.utcnow()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to create remote proxy: {e}")
+            return LoadResult(
+                success=False,
+                error=f"Failed to create remote proxy: {str(e)}"
+            )
+```
+
+## Key Benefits of Using FastMCP's Native Proxy:
+
+1. **Automatic Session Isolation**: FastMCP's `ProxyClient` handles session isolation automatically
+2. **Feature Forwarding**: Sampling, elicitation, logging, and progress are automatically forwarded
+3. **Transport Bridging**: Built-in support for exposing servers on different transports
+4. **Less Code**: We don't need custom proxy apps - FastMCP handles it all
+5. **Better Testing**: FastMCP's proxy supports in-memory testing
+6. **Multi-Server Support**: Native support for MCPConfig format with multiple servers
+
+This approach is much cleaner and leverages FastMCP's excellent proxy capabilities instead of building our own transport adapters!
