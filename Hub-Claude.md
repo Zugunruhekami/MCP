@@ -1188,3 +1188,742 @@ This approach provides:
 - Environment-based configuration support
 - Better organization for production deployments
 - Cross-platform path handling using `pathlib`
+
+
+
+
+Here's the implementation for a UVX loader and the updated structure to handle multiple package managers:
+
+## 1. **loaders/uvx.py** (New UVX Loader)
+
+```python
+import asyncio
+import tempfile
+import shutil
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+import sys
+
+from .base import ServerLoader, LoadResult
+from ..models.registry import ServerEntry
+
+
+class UVXServerLoader(ServerLoader):
+    """Loader for Python packages that can be run with uvx"""
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        # Find uvx package configuration
+        uvx_package = None
+        for package in entry.packages:
+            if package.registry_name == "uvx":
+                uvx_package = package
+                break
+        
+        if not uvx_package:
+            return LoadResult(
+                success=False,
+                error="No uvx package configuration found"
+            )
+        
+        try:
+            # Prepare environment variables
+            env = self._prepare_environment(uvx_package)
+            
+            # Build uvx command
+            cmd = self._build_uvx_command(uvx_package)
+            
+            # Create server process
+            process = await self._start_uvx_process(cmd, env)
+            
+            # Get connection info from the process
+            connection_info = await self._get_connection_info(process)
+            
+            return LoadResult(
+                success=True,
+                connection_info=connection_info,
+                process=process,
+                cleanup_func=lambda: asyncio.create_task(self._cleanup(process))
+            )
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load uvx package: {str(e)}"
+            )
+    
+    def _build_uvx_command(self, package) -> List[str]:
+        """Build the uvx command line"""
+        cmd = ["uvx"]
+        
+        # Add any uvx-specific options
+        if package.uvx_options:
+            for opt in package.uvx_options:
+                cmd.append(opt)
+        
+        # Add package name with optional version
+        if package.version and package.version != "latest":
+            cmd.append(f"{package.name}=={package.version}")
+        else:
+            cmd.append(package.name)
+        
+        # Add MCP server module/command
+        if package.entry_point:
+            cmd.append(package.entry_point)
+        else:
+            # Default to running as MCP server
+            cmd.extend(["-m", "mcp"])
+        
+        # Add package arguments
+        for arg in package.package_arguments:
+            if arg.type == "positional":
+                cmd.append(arg.value)
+            else:  # flag
+                cmd.append(f"--{arg.name}")
+                if arg.value:
+                    cmd.append(arg.value)
+        
+        return cmd
+    
+    def _prepare_environment(self, package) -> Dict[str, str]:
+        """Prepare environment variables"""
+        import os
+        env = os.environ.copy()
+        
+        # Add package-specific environment variables
+        for env_var in package.environment_variables:
+            value = os.getenv(env_var.name, env_var.default)
+            if value:
+                env[env_var.name] = value
+            elif env_var.required:
+                raise ValueError(f"Required environment variable {env_var.name} not set")
+        
+        # Ensure Python can find modules
+        if "PYTHONPATH" in env:
+            env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{sys.path[0]}"
+        else:
+            env["PYTHONPATH"] = sys.path[0]
+        
+        return env
+    
+    async def _start_uvx_process(self, cmd: List[str], env: Dict[str, str]):
+        """Start the uvx process"""
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE
+        )
+        
+        # Wait a bit to ensure the process starts
+        await asyncio.sleep(2)
+        
+        # Check if process is still running
+        if process.returncode is not None:
+            stderr = await process.stderr.read()
+            raise RuntimeError(f"uvx process exited immediately: {stderr.decode()}")
+        
+        return process
+    
+    async def _get_connection_info(self, process) -> Dict[str, Any]:
+        """Extract MCP connection info from the process"""
+        # For MCP servers, they typically output connection info to stdout
+        try:
+            # Read initial output
+            data = await asyncio.wait_for(process.stdout.readline(), timeout=5.0)
+            line = data.decode().strip()
+            
+            # Parse MCP connection info (adjust based on actual format)
+            import json
+            if line.startswith("{"):
+                return json.loads(line)
+            else:
+                # Default stdio connection
+                return {
+                    "type": "stdio",
+                    "process": process
+                }
+        except asyncio.TimeoutError:
+            # Assume stdio connection if no explicit info
+            return {
+                "type": "stdio", 
+                "process": process
+            }
+    
+    async def _cleanup(self, process):
+        """Clean up the uvx process"""
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+```
+
+## 2. **loaders/package.py** (Updated Base Package Loader)
+
+```python
+from abc import ABC, abstractmethod
+from typing import Optional, List, Dict, Any
+import asyncio
+
+from .base import ServerLoader, LoadResult
+from ..models.registry import ServerEntry, PackageInfo
+
+
+class PackageServerLoader(ServerLoader, ABC):
+    """Base class for package-based server loaders"""
+    
+    @abstractmethod
+    def get_registry_name(self) -> str:
+        """Get the package registry name this loader handles"""
+        pass
+    
+    @abstractmethod
+    async def install_package(self, package: PackageInfo) -> bool:
+        """Install the package if needed"""
+        pass
+    
+    @abstractmethod
+    async def run_package(self, package: PackageInfo, env: Dict[str, str]) -> asyncio.subprocess.Process:
+        """Run the installed package"""
+        pass
+    
+    async def load(self, entry: ServerEntry) -> LoadResult:
+        """Common loading logic for package-based servers"""
+        # Find package for this loader
+        package = self._find_package(entry)
+        if not package:
+            return LoadResult(
+                success=False,
+                error=f"No {self.get_registry_name()} package configuration found"
+            )
+        
+        try:
+            # Install package if needed
+            if not await self.install_package(package):
+                return LoadResult(
+                    success=False,
+                    error=f"Failed to install {self.get_registry_name()} package"
+                )
+            
+            # Prepare environment
+            env = self._prepare_environment(package)
+            
+            # Run the package
+            process = await self.run_package(package, env)
+            
+            # Get connection info
+            connection_info = await self._get_connection_info(process)
+            
+            return LoadResult(
+                success=True,
+                connection_info=connection_info,
+                process=process,
+                cleanup_func=lambda: asyncio.create_task(self._cleanup(process))
+            )
+            
+        except Exception as e:
+            return LoadResult(
+                success=False,
+                error=f"Failed to load {self.get_registry_name()} package: {str(e)}"
+            )
+    
+    def _find_package(self, entry: ServerEntry) -> Optional[PackageInfo]:
+        """Find package configuration for this loader"""
+        for package in entry.packages:
+            if package.registry_name == self.get_registry_name():
+                return package
+        return None
+    
+    def _prepare_environment(self, package: PackageInfo) -> Dict[str, str]:
+        """Prepare environment variables"""
+        import os
+        env = os.environ.copy()
+        
+        for env_var in package.environment_variables:
+            value = os.getenv(env_var.name, env_var.default)
+            if value:
+                env[env_var.name] = value
+            elif env_var.required:
+                raise ValueError(f"Required environment variable {env_var.name} not set")
+        
+        return env
+    
+    async def _get_connection_info(self, process) -> Dict[str, Any]:
+        """Extract MCP connection info from the process"""
+        # Default implementation - can be overridden
+        return {
+            "type": "stdio",
+            "process": process
+        }
+    
+    async def _cleanup(self, process):
+        """Clean up the process"""
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+```
+
+## 3. **loaders/npm.py** (Refactored NPM Loader)
+
+```python
+import asyncio
+import json
+import shutil
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+from .package import PackageServerLoader
+from ..models.registry import PackageInfo
+
+
+class NPMServerLoader(PackageServerLoader):
+    """Loader for NPM-based MCP servers"""
+    
+    def get_registry_name(self) -> str:
+        return "npm"
+    
+    async def install_package(self, package: PackageInfo) -> bool:
+        """Install NPM package using npm or npx"""
+        # Check if package is already installed globally
+        check_cmd = ["npm", "list", "-g", package.name, "--json"]
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await proc.communicate()
+            
+            if proc.returncode == 0:
+                data = json.loads(stdout)
+                if package.name in data.get("dependencies", {}):
+                    return True  # Already installed
+        except:
+            pass  # Continue to installation
+        
+        # Install the package globally
+        install_cmd = ["npm", "install", "-g"]
+        if package.version and package.version != "latest":
+            install_cmd.append(f"{package.name}@{package.version}")
+        else:
+            install_cmd.append(package.name)
+        
+        proc = await asyncio.create_subprocess_exec(
+            *install_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await proc.communicate()
+        return proc.returncode == 0
+    
+    async def run_package(self, package: PackageInfo, env: Dict[str, str]) -> asyncio.subprocess.Process:
+        """Run the NPM package"""
+        # Build command
+        cmd = ["npx", package.name]
+        
+        # Add entry point if specified
+        if package.entry_point:
+            cmd.append(package.entry_point)
+        
+        # Add arguments
+        for arg in package.package_arguments:
+            if arg.type == "positional":
+                cmd.append(arg.value)
+            else:  # flag
+                cmd.append(f"--{arg.name}")
+                if arg.value:
+                    cmd.append(arg.value)
+        
+        # Start process
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE
+        )
+        
+        # Wait a bit to ensure process starts
+        await asyncio.sleep(2)
+        
+        if process.returncode is not None:
+            stderr = await process.stderr.read()
+            raise RuntimeError(f"NPM process exited immediately: {stderr.decode()}")
+        
+        return process
+```
+
+## 4. **loaders/pypi.py** (New PyPI Loader)
+
+```python
+import asyncio
+import sys
+import subprocess
+from typing import Dict, Any
+
+from .package import PackageServerLoader
+from ..models.registry import PackageInfo
+
+
+class PyPIServerLoader(PackageServerLoader):
+    """Loader for PyPI-based MCP servers using pip"""
+    
+    def get_registry_name(self) -> str:
+        return "pypi"
+    
+    async def install_package(self, package: PackageInfo) -> bool:
+        """Install package using pip"""
+        # Check if already installed
+        check_cmd = [sys.executable, "-m", "pip", "show", package.name]
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.communicate()
+            
+            if proc.returncode == 0:
+                # TODO: Check version if needed
+                return True
+        except:
+            pass
+        
+        # Install the package
+        install_cmd = [sys.executable, "-m", "pip", "install"]
+        if package.version and package.version != "latest":
+            install_cmd.append(f"{package.name}=={package.version}")
+        else:
+            install_cmd.append(package.name)
+        
+        proc = await asyncio.create_subprocess_exec(
+            *install_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await proc.communicate()
+        return proc.returncode == 0
+    
+    async def run_package(self, package: PackageInfo, env: Dict[str, str]) -> asyncio.subprocess.Process:
+        """Run the Python package as MCP server"""
+        # Build command
+        if package.entry_point:
+            # Use entry point directly
+            cmd = [sys.executable, "-m", package.entry_point]
+        else:
+            # Assume package provides MCP server at package.mcp
+            cmd = [sys.executable, "-m", f"{package.name}.mcp"]
+        
+        # Add arguments
+        for arg in package.package_arguments:
+            if arg.type == "positional":
+                cmd.append(arg.value)
+            else:  # flag
+                cmd.append(f"--{arg.name}")
+                if arg.value:
+                    cmd.append(arg.value)
+        
+        # Start process
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE
+        )
+        
+        await asyncio.sleep(2)
+        
+        if process.returncode is not None:
+            stderr = await process.stderr.read()
+            raise RuntimeError(f"Python process exited immediately: {stderr.decode()}")
+        
+        return process
+```
+
+## 5. **models/server.py** (Updated Package Models)
+
+```python
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+
+
+class PackageArgument(BaseModel):
+    """Argument for package execution"""
+    name: Optional[str] = None
+    description: str
+    is_required: bool = True
+    format: str = "string"
+    value: Optional[str] = None
+    default: Optional[str] = None
+    type: str = "positional"  # positional or flag
+
+
+class EnvironmentVariable(BaseModel):
+    """Environment variable configuration"""
+    name: str
+    description: str
+    required: bool = True
+    default: Optional[str] = None
+
+
+class UVXOptions(BaseModel):
+    """UVX-specific options"""
+    python_version: Optional[str] = None  # e.g., "3.11"
+    with_packages: List[str] = Field(default_factory=list)  # Additional packages
+    index_url: Optional[str] = None  # Custom package index
+
+
+class PackageInfo(BaseModel):
+    """Package configuration for any package manager"""
+    registry_name: str  # npm, pypi, uvx, docker
+    name: str
+    version: Optional[str] = "latest"
+    
+    # Entry point or command to run
+    entry_point: Optional[str] = None
+    
+    # Arguments
+    package_arguments: List[PackageArgument] = Field(default_factory=list)
+    runtime_arguments: List[PackageArgument] = Field(default_factory=list)
+    
+    # Environment
+    environment_variables: List[EnvironmentVariable] = Field(default_factory=list)
+    
+    # Package manager specific options
+    npm_options: Optional[Dict[str, Any]] = None
+    pip_options: Optional[Dict[str, Any]] = None
+    uvx_options: Optional[List[str]] = None  # Raw uvx command options
+    docker_options: Optional[Dict[str, Any]] = None
+```
+
+## 6. **loaders/__init__.py** (Updated Loader Registry)
+
+```python
+from typing import Dict, Type
+
+from .base import ServerLoader
+from .openapi import OpenAPIServerLoader
+from .module import ModuleServerLoader
+from .npm import NPMServerLoader
+from .pypi import PyPIServerLoader
+from .uvx import UVXServerLoader
+from .docker import DockerServerLoader
+
+
+# Registry of loaders by package registry name
+PACKAGE_LOADERS: Dict[str, Type[ServerLoader]] = {
+    "npm": NPMServerLoader,
+    "pypi": PyPIServerLoader,
+    "uvx": UVXServerLoader,
+    "docker": DockerServerLoader,
+}
+
+
+def get_loader_for_entry(entry) -> ServerLoader:
+    """Get the appropriate loader for a server entry"""
+    # Check for OpenAPI configuration
+    if entry.openapi_config:
+        return OpenAPIServerLoader()
+    
+    # Check for module configuration
+    if hasattr(entry, 'module_config') and entry.module_config:
+        return ModuleServerLoader()
+    
+    # Check for package configuration
+    if entry.packages:
+        # Use the first package's registry to determine loader
+        registry_name = entry.packages[0].registry_name
+        loader_class = PACKAGE_LOADERS.get(registry_name)
+        if loader_class:
+            return loader_class()
+    
+    raise ValueError(f"No suitable loader found for entry: {entry.id}")
+```
+
+## 7. **Example YAML Configuration with UVX**
+
+```yaml
+servers:
+  # UVX-based server example
+  - id: "mcp-simple-server"
+    name: "Simple MCP Server"
+    description: "Basic MCP server installed via uvx"
+    repository:
+      url: "https://github.com/example/mcp-simple"
+      source: "github"
+    version_detail:
+      version: "1.0.0"
+      release_date: "2025-01-15T00:00:00Z"
+      is_latest: true
+    packages:
+      - registry_name: "uvx"
+        name: "mcp-simple"
+        version: "1.0.0"
+        entry_point: "server"  # Will run: uvx mcp-simple server
+        uvx_options:
+          - "--python"
+          - "3.11"
+        package_arguments:
+          - description: "Server name"
+            is_required: true
+            value: "simple-server"
+            type: "positional"
+          - name: "port"
+            description: "Server port"
+            value: "8090"
+            type: "flag"
+        environment_variables:
+          - name: "MCP_LOG_LEVEL"
+            description: "Logging level"
+            required: false
+            default: "info"
+    tags: ["uvx", "python", "simple"]
+    enabled: true
+
+  # FastAPI-based MCP server via uvx
+  - id: "fastapi-mcp-server"
+    name: "FastAPI MCP Server"
+    description: "FastAPI-based MCP server with auto-reload"
+    repository:
+      url: "https://github.com/example/fastapi-mcp"
+      source: "github"
+    packages:
+      - registry_name: "uvx"
+        name: "fastapi-mcp[all]"  # Include optional dependencies
+        version: "2.0.0"
+        uvx_options:
+          - "--with"
+          - "uvicorn"
+          - "--with" 
+          - "httpx"
+        package_arguments:
+          - name: "reload"
+            description: "Enable auto-reload"
+            type: "flag"
+          - name: "host"
+            description: "Host to bind"
+            value: "0.0.0.0"
+            type: "flag"
+    tags: ["uvx", "fastapi", "api"]
+    enabled: true
+
+  # Tool that can be run via multiple package managers
+  - id: "multi-package-server"
+    name: "Multi-Package MCP Server"
+    description: "Available via npm, pip, or uvx"
+    repository:
+      url: "https://github.com/example/multi-mcp"
+      source: "github"
+    packages:
+      # NPM version
+      - registry_name: "npm"
+        name: "@example/multi-mcp"
+        version: "1.0.0"
+      # PyPI version
+      - registry_name: "pypi"
+        name: "multi-mcp"
+        version: "1.0.0"
+      # UVX version (preferred for Python users)
+      - registry_name: "uvx"
+        name: "multi-mcp"
+        version: "1.0.0"
+        uvx_options:
+          - "--python"
+          - ">=3.9"
+    tags: ["multi-platform", "python", "node"]
+    enabled: true
+```
+
+## 8. **CLI Support for UVX**
+
+```python
+# In cli.py, add uvx-specific commands
+
+@cli.command()
+@click.argument('package_name')
+@click.option('--version', default='latest', help='Package version')
+@click.option('--python', help='Python version for uvx')
+@click.option('--test', is_flag=True, help='Test the package installation')
+def add_uvx_server(package_name: str, version: str, python: Optional[str], test: bool):
+    """Add a UVX-based MCP server"""
+    
+    async def add_server():
+        if test:
+            # Test uvx installation
+            cmd = ["uvx", "--version"]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode != 0:
+                click.echo("uvx is not installed. Install with: pip install uvx", err=True)
+                return
+            
+            click.echo(f"uvx version: {stdout.decode().strip()}")
+        
+        # Generate server configuration
+        server_id = package_name.replace("_", "-").replace("/", "-")
+        
+        config = {
+            "id": server_id,
+            "name": f"{package_name} Server",
+            "description": f"MCP server from uvx package {package_name}",
+            "repository": {
+                "url": "",
+                "source": "uvx"
+            },
+            "version_detail": {
+                "version": version,
+                "release_date": datetime.utcnow().isoformat() + "Z",
+                "is_latest": version == "latest"
+            },
+            "packages": [
+                {
+                    "registry_name": "uvx",
+                    "name": package_name,
+                    "version": version,
+                    "uvx_options": []
+                }
+            ],
+            "tags": ["uvx", "python"],
+            "enabled": True
+        }
+        
+        if python:
+            config["packages"][0]["uvx_options"] = ["--python", python]
+        
+        # Save configuration
+        output_file = f"{server_id}.yaml"
+        with open(output_file, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        
+        click.echo(f"Server configuration saved to {output_file}")
+        click.echo(f"Import with: python -m mcp_hub_registry import-server {output_file}")
+    
+    asyncio.run(add_server())
+```
+
+This implementation provides:
+
+1. **Flexible package management** - Support for npm, pip, uvx, and docker
+2. **UVX-specific features** - Python version selection, additional packages
+3. **Common base class** - Shared logic for all package managers
+4. **Multi-platform support** - Servers can specify multiple package options
+5. **Clean separation** - Each loader handles its specific package manager
+
+The structure allows easy addition of new package managers while maintaining consistent behavior across all loaders.
