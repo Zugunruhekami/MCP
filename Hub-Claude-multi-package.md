@@ -3605,3 +3605,604 @@ The main differences are:
 4. **Code Style**: Sonnet is more modular with separate methods, Opus is more direct
 
 Both provide comprehensive solutions, but Sonnet-4-Reasoning offers more advanced features for configuration handling while Opus-4 provides more deployment alternatives. The choice between them would depend on whether you need conditional configuration (Sonnet) or more deployment flexibility (Opus).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# FINAL
+You're absolutely right! I've been overcomplicating things. Let's simplify the design while keeping the good parts like `substitute_env_vars` and clean inheritance. Here's a streamlined approach:
+
+## 1. Simplified Config Models Structure
+
+```
+src/mcp_hub/
+├── config/
+│   ├── __init__.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── base.py          # Base config models
+│   │   ├── hub.py           # HubConfig
+│   │   ├── server.py        # ServerConfig
+│   │   ├── package.py       # PackageConfig with transport
+│   │   └── transport.py     # TransportConfig
+│   ├── parser.py            # Config parsing with env substitution
+│   └── secrets.py           # Simple secret management
+```
+
+## 2. Base Configuration Models
+
+```python
+# src/mcp_hub/config/models/base.py
+
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional
+from pydantic import BaseModel, validator
+
+
+class BaseConfig(BaseModel):
+    """Base configuration with environment variable substitution"""
+    
+    class Config:
+        extra = "allow"  # Allow extra fields for flexibility
+    
+    def __init__(self, **data):
+        # Substitute environment variables before validation
+        data = substitute_env_vars(data)
+        super().__init__(**data)
+
+
+def substitute_env_vars(data: Any) -> Any:
+    """Recursively substitute ${VAR} with environment variables"""
+    if isinstance(data, dict):
+        return {k: substitute_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [substitute_env_vars(item) for item in data]
+    elif isinstance(data, str):
+        def replacer(match):
+            var_name = match.group(1)
+            # First try exact match, then with MCP_ prefix
+            return os.environ.get(var_name) or os.environ.get(f"MCP_{var_name}", match.group(0))
+        return re.sub(r'\$\{([^}]+)\}', replacer, data)
+    else:
+        return data
+```
+
+## 3. Transport Configuration
+
+```python
+# src/mcp_hub/config/models/transport.py
+
+from enum import Enum
+from typing import Optional, Dict, Any, List
+from pydantic import Field
+
+from .base import BaseConfig
+
+
+class TransportType(str, Enum):
+    STDIO = "stdio"
+    HTTP = "http"
+    SSE = "sse"
+    WEBSOCKET = "websocket"
+
+
+class TransportConfig(BaseConfig):
+    """Transport configuration for servers"""
+    type: TransportType = TransportType.STDIO
+    host: Optional[str] = "127.0.0.1"
+    port: Optional[int] = None
+    endpoint: Optional[str] = None
+    headers: Dict[str, str] = Field(default_factory=dict)
+    timeout: int = 30
+```
+
+## 4. Package Configuration
+
+```python
+# src/mcp_hub/config/models/package.py
+
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+from pydantic import Field, validator
+
+from .base import BaseConfig
+from .transport import TransportConfig
+
+
+class PackageConfig(BaseConfig):
+    """Universal package configuration for uvx/npm/pypi"""
+    # Package identification
+    name: str
+    version: Optional[str] = "latest"
+    registry: str = "uvx"  # uvx, npm, pypi
+    
+    # Execution
+    entry_point: Optional[str] = None
+    command_override: Optional[List[str]] = None  # Override entire command
+    
+    # Transport
+    transport: TransportConfig = Field(default_factory=TransportConfig)
+    
+    # Arguments
+    args: List[str] = Field(default_factory=list)
+    
+    # Environment
+    env: Dict[str, str] = Field(default_factory=dict)
+    python_version: Optional[str] = None
+    python_from_file: Optional[str] = None  # Read from .python-version
+    
+    @validator('python_version', always=True)
+    def resolve_python_version(cls, v, values):
+        """Resolve Python version from file if needed"""
+        if not v and values.get('python_from_file'):
+            version_file = Path(values['python_from_file'])
+            if version_file.exists():
+                return version_file.read_text().strip()
+        return v
+```
+
+## 5. Server Configuration
+
+```python
+# src/mcp_hub/config/models/server.py
+
+from typing import Optional, Dict, Any, List, Union
+from pydantic import Field, validator
+
+from .base import BaseConfig
+from .package import PackageConfig
+
+
+class ServerConfig(BaseConfig):
+    """Server configuration"""
+    id: str
+    name: str
+    description: str = ""
+    enabled: bool = True
+    mount_path: Optional[str] = None
+    
+    # Loader type
+    loader_type: str = "package"  # package, openapi, module, proxy
+    
+    # Package configuration (for package loader)
+    package: Optional[PackageConfig] = None
+    
+    # OpenAPI configuration
+    openapi_url: Optional[str] = None
+    base_url: Optional[str] = None
+    
+    # Module configuration
+    module_path: Optional[str] = None
+    factory_function: str = "create_server"
+    
+    # Proxy configuration (URL or command)
+    proxy_connection: Optional[Union[str, Dict[str, Any]]] = None
+    
+    # Common
+    retry_attempts: int = 3
+    retry_delay: float = 2.0
+    timeout: int = 30
+    
+    @validator('mount_path', always=True)
+    def set_default_mount_path(cls, v, values):
+        if not v and 'id' in values:
+            return f"/{values['id']}"
+        return v
+    
+    @validator('loader_type', always=True)
+    def infer_loader_type(cls, v, values):
+        """Auto-detect loader type if not specified"""
+        if v:
+            return v
+        if values.get('openapi_url'):
+            return 'openapi'
+        elif values.get('module_path'):
+            return 'module'
+        elif values.get('proxy_connection'):
+            return 'proxy'
+        elif values.get('package'):
+            return 'package'
+        return 'package'
+```
+
+## 6. Simplified Base Package Loader
+
+```python
+# src/mcp_hub/loaders/base_package.py
+
+import asyncio
+import os
+from abc import abstractmethod
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+from datetime import datetime
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from .base import ServerLoader, LoadResult
+from ..config.models.server import ServerConfig
+from ..config.models.transport import TransportType
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class BasePackageLoader(ServerLoader):
+    """Base loader for package-based servers (uvx, npm, pypi)"""
+    
+    @abstractmethod
+    def get_install_command(self, package_name: str, version: Optional[str]) -> List[str]:
+        """Get command to install package"""
+        pass
+    
+    @abstractmethod
+    def get_run_command(self, package_name: str, entry_point: Optional[str]) -> List[str]:
+        """Get command to run package"""
+        pass
+    
+    async def load(self, config: ServerConfig) -> LoadResult:
+        """Load package-based server using FastMCP proxy"""
+        if not config.package:
+            return LoadResult(
+                success=False,
+                error=f"No package configuration found for {config.id}"
+            )
+        
+        try:
+            package = config.package
+            
+            # Build command
+            cmd = self._build_command(package)
+            
+            # Prepare environment
+            env = self._prepare_environment(package)
+            
+            # Create proxy based on transport
+            if package.transport.type == TransportType.STDIO:
+                # Direct stdio proxy
+                proxy_client = ProxyClient(cmd, env=env)
+            else:
+                # For HTTP transports, assume the package handles the server
+                # and we connect to the URL
+                url = self._build_url(package.transport)
+                proxy_client = ProxyClient(url)
+            
+            # Create FastMCP proxy server
+            proxy_server = FastMCP.as_proxy(
+                proxy_client,
+                name=f"{config.name} ({package.registry})"
+            )
+            
+            return LoadResult(
+                success=True,
+                app=proxy_server.get_asgi_app(),
+                mcp_instance=proxy_server,
+                connection_info={
+                    "type": package.registry,
+                    "package": package.name,
+                    "version": package.version,
+                    "transport": package.transport.type
+                },
+                loaded_at=datetime.utcnow()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load {config.package.registry} package: {e}")
+            return LoadResult(
+                success=False,
+                error=str(e)
+            )
+    
+    def _build_command(self, package) -> List[str]:
+        """Build complete command to run package"""
+        # Allow complete override
+        if package.command_override:
+            return package.command_override
+        
+        # Get base command
+        cmd = self.get_run_command(package.name, package.entry_point)
+        
+        # Add transport args if not stdio
+        if package.transport.type != TransportType.STDIO:
+            cmd.extend(self._get_transport_args(package.transport))
+        
+        # Add package arguments
+        cmd.extend(package.args)
+        
+        return cmd
+    
+    def _get_transport_args(self, transport) -> List[str]:
+        """Get transport-specific arguments"""
+        args = []
+        
+        if transport.type in [TransportType.HTTP, TransportType.SSE]:
+            args.extend(["--transport", transport.type.value])
+            
+            if transport.port:
+                args.extend(["--port", str(transport.port)])
+            
+            if transport.host and transport.host != "127.0.0.1":
+                args.extend(["--host", transport.host])
+        
+        return args
+    
+    def _prepare_environment(self, package) -> Dict[str, str]:
+        """Prepare environment variables"""
+        env = os.environ.copy()
+        
+        # Add package-specific environment variables
+        env.update(package.env)
+        
+        # Set Python version if specified
+        if package.python_version:
+            env['PYTHON_VERSION'] = package.python_version
+        
+        return env
+    
+    def _build_url(self, transport) -> str:
+        """Build URL for HTTP-based transports"""
+        protocol = "https" if transport.get("ssl", False) else "http"
+        host = transport.host or "127.0.0.1"
+        port = transport.port or 8000
+        endpoint = transport.endpoint or ""
+        
+        return f"{protocol}://{host}:{port}{endpoint}"
+```
+
+## 7. Simple Package Loaders
+
+```python
+# src/mcp_hub/loaders/uvx.py
+
+from typing import List, Optional
+from .base_package import BasePackageLoader
+
+
+class UVXLoader(BasePackageLoader):
+    """Loader for UVX packages"""
+    
+    def get_install_command(self, package_name: str, version: Optional[str]) -> List[str]:
+        """UVX doesn't need separate install"""
+        return []
+    
+    def get_run_command(self, package_name: str, entry_point: Optional[str]) -> List[str]:
+        """Get uvx run command"""
+        cmd = ["uvx"]
+        
+        # Add package with version
+        if version and version != "latest":
+            cmd.append(f"{package_name}=={version}")
+        else:
+            cmd.append(package_name)
+        
+        # Add entry point if specified
+        if entry_point:
+            cmd.append(entry_point)
+        
+        return cmd
+```
+
+```python
+# src/mcp_hub/loaders/npm.py
+
+from typing import List, Optional
+from .base_package import BasePackageLoader
+
+
+class NPMLoader(BasePackageLoader):
+    """Loader for NPM packages"""
+    
+    def get_install_command(self, package_name: str, version: Optional[str]) -> List[str]:
+        """Get npm install command"""
+        cmd = ["npm", "install", "-g"]
+        if version and version != "latest":
+            cmd.append(f"{package_name}@{version}")
+        else:
+            cmd.append(package_name)
+        return cmd
+    
+    def get_run_command(self, package_name: str, entry_point: Optional[str]) -> List[str]:
+        """Get npx run command"""
+        cmd = ["npx", package_name]
+        if entry_point:
+            cmd.append(entry_point)
+        return cmd
+```
+
+## 8. Simplified Factory
+
+```python
+# src/mcp_hub/loaders/factory.py
+
+from typing import Optional, Dict, Type
+
+from .base import ServerLoader
+from .openapi import OpenAPIServerLoader
+from .module import ModuleServerLoader  
+from .proxy import ProxyServerLoader
+from .uvx import UVXLoader
+from .npm import NPMLoader
+from .pypi import PyPILoader
+from ..config.models.server import ServerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class LoaderFactory:
+    """Factory for creating server loaders"""
+    
+    def __init__(self):
+        # Register loaders
+        self._loaders: Dict[str, Type[ServerLoader]] = {
+            'openapi': OpenAPIServerLoader,
+            'module': ModuleServerLoader,
+            'proxy': ProxyServerLoader,
+            'package': self._get_package_loader,  # Dynamic based on registry
+        }
+        
+        # Package loaders by registry
+        self._package_loaders = {
+            'uvx': UVXLoader,
+            'npm': NPMLoader,
+            'pypi': PyPILoader,
+        }
+    
+    def get_loader(self, config: ServerConfig) -> Optional[ServerLoader]:
+        """Get appropriate loader for server config"""
+        loader_type = config.loader_type
+        
+        if loader_type in self._loaders:
+            if loader_type == 'package':
+                return self._get_package_loader(config)
+            else:
+                loader_class = self._loaders[loader_type]
+                return loader_class()
+        
+        logger.error(f"Unknown loader type: {loader_type}")
+        return None
+    
+    def _get_package_loader(self, config: ServerConfig) -> Optional[ServerLoader]:
+        """Get package loader based on registry"""
+        if not config.package:
+            logger.error(f"No package config for server {config.id}")
+            return None
+        
+        registry = config.package.registry
+        loader_class = self._package_loaders.get(registry)
+        
+        if loader_class:
+            return loader_class()
+        
+        logger.error(f"Unknown package registry: {registry}")
+        return None
+```
+
+## 9. Simple Secret Management
+
+```python
+# src/mcp_hub/config/secrets.py
+
+import os
+from pathlib import Path
+from typing import Dict, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SimpleSecretManager:
+    """Simple secret management using .env files and environment"""
+    
+    def __init__(self, env_files: Optional[list] = None):
+        self.env_files = env_files or ['.env', '.env.local']
+        self._loaded = False
+    
+    def load_secrets(self):
+        """Load secrets from .env files"""
+        if self._loaded:
+            return
+        
+        for env_file in self.env_files:
+            env_path = Path(env_file)
+            if env_path.exists():
+                self._load_env_file(env_path)
+                logger.info(f"Loaded secrets from {env_file}")
+        
+        self._loaded = True
+    
+    def _load_env_file(self, path: Path):
+        """Load a single .env file"""
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"\'')
+                    
+                    # Only set if not already in environment
+                    if key not in os.environ:
+                        os.environ[key] = value
+    
+    def get_secret(self, key: str) -> Optional[str]:
+        """Get a secret value"""
+        self.load_secrets()
+        return os.environ.get(key)
+```
+
+## 10. Clean servers.yaml
+
+```yaml
+# servers.yaml
+
+servers:
+  # Simple UVX package
+  - id: "memory"
+    name: "Memory Assistant"
+    package:
+      name: "@modelcontextprotocol/server-memory"
+      registry: "uvx"
+  
+  # UVX with Python version from file
+  - id: "jira"
+    name: "JIRA Integration"
+    package:
+      name: "mcp-server-jira"
+      version: "1.0.0"
+      registry: "uvx"
+      python_from_file: ".python-version"
+      env:
+        JIRA_URL: "${JIRA_URL}"
+        JIRA_TOKEN: "${JIRA_TOKEN}"
+      args: ["--project", "MYPROJ"]
+  
+  # NPM package with HTTP transport
+  - id: "github"
+    name: "GitHub Tools"
+    package:
+      name: "@modelcontextprotocol/server-github"
+      registry: "npm"
+      transport:
+        type: "http"
+        port: 8001
+      env:
+        GITHUB_TOKEN: "${GITHUB_TOKEN}"
+  
+  # OpenAPI server
+  - id: "weather"
+    name: "Weather API"
+    loader_type: "openapi"
+    openapi_url: "https://api.weather.com/openapi.yaml"
+    base_url: "https://api.weather.com"
+  
+  # Proxy to remote server
+  - id: "remote-ai"
+    name: "Remote AI Service"
+    loader_type: "proxy"
+    proxy_connection: "https://ai-service.example.com/mcp/sse"
+```
+
+## Key Simplifications:
+
+1. **Single `package` loader type**: All package loaders (uvx, npm, pypi) inherit from `BasePackageLoader`
+2. **Simple environment substitution**: The `substitute_env_vars` function handles ${VAR} patterns
+3. **Clean config structure**: Separate models folder for better organization
+4. **Minimal secret management**: Simple .env file loading, can be extended for remote services
+5. **Transport configuration**: Properly included in PackageConfig
+6. **Python version handling**: Built into PackageConfig with file reading support
+
+This design is much cleaner and easier to understand while still supporting all the required features!
