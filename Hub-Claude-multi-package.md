@@ -1916,3 +1916,751 @@ mcp, app, error = await load_server_with_retry_legacy(config)
 6. **Backward Compatibility**: Legacy wrapper available for gradual migration
 
 This makes the codebase more maintainable and provides a cleaner, more consistent API throughout the loader system!
+
+
+Let me explain the differences between these configuration options and provide a comprehensive implementation with proper secret handling for both local development and production environments.
+
+## Understanding the Different Configuration Levels
+
+### 1. **Configuration Hierarchy**
+
+```python
+# src/mcp_hub/models/package.py
+
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, validator
+import os
+from pathlib import Path
+
+
+class EnvironmentVariable(BaseModel):
+    """Environment variable configuration"""
+    name: str
+    value: Optional[str] = None          # Direct value
+    default: Optional[str] = None        # Default if not in environment
+    required: bool = False               # Fail if not provided
+    from_file: Optional[str] = None      # Read from file
+    from_env: Optional[str] = None       # Read from different env var
+    
+    def resolve(self, env: Dict[str, str], project_root: Path) -> Optional[str]:
+        """Resolve the actual value"""
+        # Priority order: value > from_env > from_file > environment > default
+        
+        # 1. Direct value
+        if self.value is not None:
+            return self._expand_vars(self.value, env)
+        
+        # 2. From different environment variable
+        if self.from_env:
+            value = env.get(self.from_env)
+            if value:
+                return value
+        
+        # 3. From file
+        if self.from_file:
+            file_path = project_root / self.from_file
+            if file_path.exists():
+                return file_path.read_text().strip()
+        
+        # 4. From environment
+        value = env.get(self.name)
+        if value:
+            return value
+        
+        # 5. Default
+        if self.default is not None:
+            return self._expand_vars(self.default, env)
+        
+        # 6. Required check
+        if self.required:
+            raise ValueError(f"Required environment variable '{self.name}' not found")
+        
+        return None
+    
+    def _expand_vars(self, value: str, env: Dict[str, str]) -> str:
+        """Expand ${VAR} references"""
+        import re
+        def replacer(match):
+            var_name = match.group(1)
+            return env.get(var_name, match.group(0))
+        return re.sub(r'\$\{([^}]+)\}', replacer, value)
+
+
+class PackageArgument(BaseModel):
+    """Command-line argument for the package"""
+    name: str
+    value: Optional[str] = None
+    type: str = "flag"  # flag, option, positional
+    env_var: Optional[str] = None  # Get value from env var
+    
+    def resolve(self, env: Dict[str, str]) -> List[str]:
+        """Convert to command line arguments"""
+        # Get value from env var if specified
+        if self.env_var and not self.value:
+            self.value = env.get(self.env_var)
+        
+        if self.type == "positional":
+            return [self.value] if self.value else []
+        elif self.type == "flag":
+            return [f"--{self.name}"] if self.value != "false" else []
+        else:  # option
+            if self.value:
+                return [f"--{self.name}", self.value]
+            return []
+
+
+class UvxOptions(BaseModel):
+    """UVX-specific options"""
+    python: Optional[str] = None         # Python version constraint
+    python_from_file: Optional[str] = None  # Read from .python-version
+    no_cache: bool = False
+    force_reinstall: bool = False
+    index_url: Optional[str] = None
+    extra_index_url: Optional[List[str]] = None
+    
+    def to_args(self, project_root: Path) -> List[str]:
+        """Convert to uvx command line arguments"""
+        args = []
+        
+        # Python version
+        python_version = self.python
+        if not python_version and self.python_from_file:
+            version_file = project_root / self.python_from_file
+            if version_file.exists():
+                python_version = version_file.read_text().strip()
+        
+        if python_version:
+            args.extend(["--python", python_version])
+        
+        # Flags
+        if self.no_cache:
+            args.append("--no-cache")
+        if self.force_reinstall:
+            args.append("--force-reinstall")
+        
+        # Index URLs
+        if self.index_url:
+            args.extend(["--index-url", self.index_url])
+        if self.extra_index_url:
+            for url in self.extra_index_url:
+                args.extend(["--extra-index-url", url])
+        
+        return args
+
+
+class PackageInfo(BaseModel):
+    """Complete package configuration"""
+    registry_name: str = "uvx"
+    name: str                           # Package name (e.g., "@modelcontextprotocol/server-memory")
+    version: Optional[str] = None       # Package version
+    entry_point: Optional[str] = None   # Specific entry point to run
+    
+    # Different configuration levels
+    uvx_options: Optional[UvxOptions] = None          # UVX-specific options
+    environment_variables: List[EnvironmentVariable] = Field(default_factory=list)  # Environment setup
+    package_arguments: List[PackageArgument] = Field(default_factory=list)         # Package CLI args
+    runtime_arguments: List[str] = Field(default_factory=list)                     # Raw args to append
+```
+
+## Detailed UVX Loader Implementation
+
+```python
+# src/mcp_hub/loaders/implementations/uvx_advanced.py
+
+import asyncio
+import logging
+import os
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from pathlib import Path
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from ...core.interfaces import IServerLoader
+from ...core.models import LoaderType
+from ...secrets import SecretManager
+from ..base import LoadResult
+
+logger = logging.getLogger(__name__)
+
+
+class AdvancedUVXLoader(IServerLoader):
+    """Advanced UVX loader with full configuration support"""
+    
+    def __init__(self, project_root: Optional[Path] = None, 
+                 secret_manager: Optional[SecretManager] = None):
+        self.project_root = project_root or Path.cwd()
+        self.secret_manager = secret_manager
+    
+    def get_loader_type(self) -> LoaderType:
+        return LoaderType.UVX
+    
+    async def validate_config(self, config: Dict[str, Any]) -> bool:
+        """Validate configuration"""
+        package_info = config.get('package_info')
+        if not package_info or not package_info.get('name'):
+            return False
+        return True
+    
+    async def load(self, config: Dict[str, Any]) -> LoadResult:
+        """Load UVX package with full configuration support"""
+        try:
+            # Extract package info
+            package_info = PackageInfo(**config['package_info'])
+            
+            # Prepare environment with secret resolution
+            env = await self._prepare_environment(package_info, config)
+            
+            # Build command
+            cmd = self._build_command(package_info, env)
+            
+            logger.info(f"Loading UVX package: {' '.join(cmd)}")
+            
+            # Create proxy client
+            proxy_client = ProxyClient(cmd, env=env)
+            
+            # Create proxy server
+            proxy_name = config.get('name', f"{package_info.name} (UVX)")
+            proxy_server = FastMCP.as_proxy(
+                proxy_client,
+                name=proxy_name
+            )
+            
+            return LoadResult(
+                success=True,
+                app=proxy_server.get_asgi_app(),
+                mcp_instance=proxy_server,
+                connection_info={
+                    "type": "uvx",
+                    "package": package_info.name,
+                    "command": cmd,
+                    "env_vars": list(env.keys())
+                },
+                loaded_at=datetime.utcnow()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load UVX package: {e}")
+            return LoadResult(
+                success=False,
+                error=str(e)
+            )
+    
+    async def _prepare_environment(self, package_info: PackageInfo, 
+                                 config: Dict[str, Any]) -> Dict[str, str]:
+        """Prepare environment with secret resolution"""
+        # Start with current environment
+        env = os.environ.copy()
+        
+        # Add any global env vars from config
+        if 'env' in config:
+            env.update(config['env'])
+        
+        # Resolve secrets if secret manager available
+        if self.secret_manager:
+            server_id = config.get('id', package_info.name)
+            secrets = await self.secret_manager.get_secrets(server_id)
+            env.update(secrets)
+        
+        # Process environment variables
+        for env_var in package_info.environment_variables:
+            value = env_var.resolve(env, self.project_root)
+            if value is not None:
+                env[env_var.name] = value
+        
+        return env
+    
+    def _build_command(self, package_info: PackageInfo, env: Dict[str, str]) -> List[str]:
+        """Build complete UVX command"""
+        cmd = ["uvx"]
+        
+        # Add UVX options
+        if package_info.uvx_options:
+            cmd.extend(package_info.uvx_options.to_args(self.project_root))
+        
+        # Add package with version
+        if package_info.version:
+            cmd.append(f"{package_info.name}=={package_info.version}")
+        else:
+            cmd.append(package_info.name)
+        
+        # Add entry point
+        if package_info.entry_point:
+            cmd.append(package_info.entry_point)
+        
+        # Add package arguments
+        for arg in package_info.package_arguments:
+            cmd.extend(arg.resolve(env))
+        
+        # Add runtime arguments
+        cmd.extend(package_info.runtime_arguments)
+        
+        return cmd
+```
+
+## Secret Management Implementation
+
+```python
+# src/mcp_hub/secrets/manager.py
+
+import os
+import json
+import yaml
+from typing import Dict, Optional, Any
+from pathlib import Path
+from abc import ABC, abstractmethod
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SecretProvider(ABC):
+    """Base secret provider interface"""
+    
+    @abstractmethod
+    async def get_secret(self, key: str) -> Optional[str]:
+        pass
+    
+    @abstractmethod
+    async def get_secrets(self, prefix: str) -> Dict[str, str]:
+        pass
+
+
+class EnvironmentSecretProvider(SecretProvider):
+    """Load secrets from environment variables"""
+    
+    def __init__(self, prefix: str = "MCP_SECRET_"):
+        self.prefix = prefix
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        return os.environ.get(f"{self.prefix}{key.upper()}")
+    
+    async def get_secrets(self, prefix: str) -> Dict[str, str]:
+        """Get all secrets for a specific server"""
+        secrets = {}
+        env_prefix = f"{self.prefix}{prefix.upper()}_"
+        
+        for key, value in os.environ.items():
+            if key.startswith(env_prefix):
+                secret_name = key[len(env_prefix):].lower()
+                secrets[secret_name] = value
+        
+        return secrets
+
+
+class FileSecretProvider(SecretProvider):
+    """Load secrets from encrypted file"""
+    
+    def __init__(self, secrets_file: Path, encryption_key: Optional[str] = None):
+        self.secrets_file = secrets_file
+        self.encryption_key = encryption_key
+        self._cache: Optional[Dict[str, Any]] = None
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        secrets = await self._load_secrets()
+        return secrets.get(key)
+    
+    async def get_secrets(self, prefix: str) -> Dict[str, str]:
+        all_secrets = await self._load_secrets()
+        return all_secrets.get(prefix, {})
+    
+    async def _load_secrets(self) -> Dict[str, Any]:
+        """Load and decrypt secrets file"""
+        if self._cache is not None:
+            return self._cache
+        
+        if not self.secrets_file.exists():
+            return {}
+        
+        with open(self.secrets_file, 'r') as f:
+            if self.secrets_file.suffix == '.json':
+                data = json.load(f)
+            else:
+                data = yaml.safe_load(f)
+        
+        # Decrypt if needed
+        if self.encryption_key and data.get('encrypted'):
+            data = self._decrypt_data(data, self.encryption_key)
+        
+        self._cache = data
+        return data
+    
+    def _decrypt_data(self, data: Dict[str, Any], key: str) -> Dict[str, Any]:
+        """Decrypt data (simplified - use proper encryption in production)"""
+        # This is a placeholder - implement proper encryption
+        return data.get('secrets', {})
+
+
+class DotEnvSecretProvider(SecretProvider):
+    """Load secrets from .env files"""
+    
+    def __init__(self, env_file: Path = None):
+        self.env_file = env_file or Path('.env')
+        self._cache: Optional[Dict[str, str]] = None
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        secrets = await self._load_env()
+        return secrets.get(key)
+    
+    async def get_secrets(self, prefix: str) -> Dict[str, str]:
+        all_secrets = await self._load_env()
+        prefix_upper = f"{prefix.upper()}_"
+        
+        return {
+            k[len(prefix_upper):].lower(): v
+            for k, v in all_secrets.items()
+            if k.startswith(prefix_upper)
+        }
+    
+    async def _load_env(self) -> Dict[str, str]:
+        """Load .env file"""
+        if self._cache is not None:
+            return self._cache
+        
+        secrets = {}
+        if self.env_file.exists():
+            with open(self.env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        secrets[key.strip()] = value.strip().strip('"\'')
+        
+        self._cache = secrets
+        return secrets
+
+
+class SecretManager:
+    """Manage secrets from multiple providers"""
+    
+    def __init__(self, providers: Optional[List[SecretProvider]] = None):
+        self.providers = providers or [
+            EnvironmentSecretProvider(),
+            DotEnvSecretProvider(),
+        ]
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        """Get a single secret"""
+        for provider in self.providers:
+            value = await provider.get_secret(key)
+            if value is not None:
+                return value
+        return None
+    
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        """Get all secrets for a server"""
+        secrets = {}
+        for provider in self.providers:
+            provider_secrets = await provider.get_secrets(server_id)
+            secrets.update(provider_secrets)
+        return secrets
+    
+    async def resolve_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve ${VAR} references in config"""
+        import re
+        
+        # Get all available secrets
+        all_secrets = {}
+        for provider in self.providers:
+            if hasattr(provider, '_load_env'):
+                all_secrets.update(await provider._load_env())
+            elif hasattr(provider, '_load_secrets'):
+                flat_secrets = await provider._load_secrets()
+                # Flatten nested secrets
+                for server_id, server_secrets in flat_secrets.items():
+                    if isinstance(server_secrets, dict):
+                        for k, v in server_secrets.items():
+                            all_secrets[f"{server_id}_{k}".upper()] = v
+        
+        # Also include environment variables
+        all_secrets.update(os.environ)
+        
+        def replace_vars(obj):
+            if isinstance(obj, str):
+                def replacer(match):
+                    var_name = match.group(1)
+                    return all_secrets.get(var_name, match.group(0))
+                return re.sub(r'\$\{([^}]+)\}', replacer, obj)
+            elif isinstance(obj, dict):
+                return {k: replace_vars(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [replace_vars(item) for item in obj]
+            return obj
+        
+        return replace_vars(config)
+```
+
+## Configuration Examples
+
+### 1. **servers.yaml with Advanced UVX Configuration**
+
+```yaml
+servers:
+  # Simple UVX package
+  - id: "memory-server"
+    name: "Memory Assistant"
+    loader_type: "uvx"
+    package_info:
+      name: "@modelcontextprotocol/server-memory"
+      version: "latest"
+  
+  # UVX with Python version from file
+  - id: "jira-server"
+    name: "JIRA Integration"
+    loader_type: "uvx"
+    package_info:
+      name: "mcp-server-jira"
+      version: "1.0.0"
+      uvx_options:
+        python_from_file: ".python-version"  # Read from project file
+        no_cache: true
+      environment_variables:
+        - name: "JIRA_URL"
+          value: "https://company.atlassian.net"
+        - name: "JIRA_TOKEN"
+          from_env: "JIRA_API_TOKEN"  # Read from different env var
+          required: true
+        - name: "JIRA_USER"
+          default: "${USER}@company.com"  # Expand from environment
+      package_arguments:
+        - name: "project"
+          value: "PROJ"
+          type: "option"
+        - name: "verbose"
+          type: "flag"
+  
+  # Complex configuration with file-based secrets
+  - id: "confluence-server"
+    name: "Confluence Wiki"
+    loader_type: "uvx"
+    package_info:
+      name: "mcp-confluence"
+      uvx_options:
+        python: ">=3.10"
+        index_url: "https://pypi.company.com/simple"
+      environment_variables:
+        - name: "CONFLUENCE_URL"
+          value: "https://company.atlassian.net/wiki"
+        - name: "CONFLUENCE_TOKEN"
+          from_file: "secrets/confluence.token"  # Read from file
+          required: true
+        - name: "LOG_LEVEL"
+          env_var: "MCP_LOG_LEVEL"
+          default: "INFO"
+      package_arguments:
+        - name: "space"
+          value: "TECH"
+          type: "option"
+        - name: "cache-dir"
+          env_var: "CONFLUENCE_CACHE_DIR"  # Get from env
+          type: "option"
+      runtime_arguments: ["--enable-search", "--enable-create"]
+```
+
+### 2. **Local Development Setup (PyCharm)**
+
+#### **.env.local** (git-ignored)
+```bash
+# Local development secrets
+JIRA_API_TOKEN=your-actual-jira-token
+CONFLUENCE_TOKEN=your-confluence-token
+MCP_SECRET_JIRA_SERVER_TOKEN=your-jira-token
+MCP_SECRET_CONFLUENCE_SERVER_TOKEN=your-confluence-token
+
+# Development settings
+MCP_LOG_LEVEL=DEBUG
+CONFLUENCE_CACHE_DIR=/tmp/confluence-cache
+```
+
+#### **PyCharm Run Configuration**
+```xml
+<configuration name="MCP Hub Dev" type="PythonConfigurationType">
+  <module name="mcp-hub" />
+  <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/mcp_hub/__main__.py" />
+  <option name="PARAMETERS" value="run --config config.yaml --servers-config servers.yaml" />
+  <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+  <envs>
+    <env name="PYTHONPATH" value="$PROJECT_DIR$/src" />
+    <env name="MCP_ENV" value="development" />
+  </envs>
+  <option name="ENV_FILE" value="$PROJECT_DIR$/.env.local" />
+</configuration>
+```
+
+### 3. **Docker Deployment**
+
+#### **Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python version file
+COPY .python-version .python-version
+
+# Install Python dependencies
+COPY pyproject.toml pyproject.toml
+RUN pip install -e . && \
+    pip install uvx
+
+# Copy application
+COPY src/ src/
+COPY config/ config/
+
+# Create secrets directory
+RUN mkdir -p /app/secrets
+
+# Run as non-root user
+RUN useradd -m -u 1000 mcp && chown -R mcp:mcp /app
+USER mcp
+
+EXPOSE 8000
+
+CMD ["python", "-m", "mcp_hub", "run"]
+```
+
+#### **docker-compose.yml**
+```yaml
+version: '3.8'
+
+services:
+  mcp-hub:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Non-sensitive config
+      MCP_ENV: production
+      MCP_LOG_LEVEL: INFO
+    env_file:
+      - .env.production  # Production secrets
+    volumes:
+      - ./config:/app/config:ro
+      - ./secrets:/app/secrets:ro  # Mount secrets directory
+      - /tmp/mcp-cache:/tmp/cache  # Cache directory
+    secrets:
+      - jira_token
+      - confluence_token
+    command: >
+      python -m mcp_hub run
+      --config /app/config/config.yaml
+      --servers-config /app/config/servers.yaml
+
+secrets:
+  jira_token:
+    file: ./secrets/jira_token.txt
+  confluence_token:
+    file: ./secrets/confluence_token.txt
+```
+
+### 4. **Production Deployment (Without AWS)**
+
+#### **Using Docker Secrets**
+```bash
+# Create secrets
+echo "your-jira-token" | docker secret create jira_token -
+echo "your-confluence-token" | docker secret create confluence_token -
+
+# Deploy with secrets
+docker stack deploy -c docker-compose.yml mcp-hub
+```
+
+#### **Using Kubernetes Secrets**
+```yaml
+# k8s-secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-secrets
+type: Opaque
+data:
+  jira-token: <base64-encoded-token>
+  confluence-token: <base64-encoded-token>
+---
+# k8s-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-hub
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: mcp-hub
+        image: mcp-hub:latest
+        env:
+        - name: JIRA_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: jira-token
+        - name: CONFLUENCE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: confluence-token
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: mcp-config
+```
+
+### 5. **Alternative: Using HashiCorp Vault**
+
+```python
+# src/mcp_hub/secrets/vault_provider.py
+
+import hvac
+from typing import Dict, Optional
+
+class VaultSecretProvider(SecretProvider):
+    """HashiCorp Vault provider"""
+    
+    def __init__(self, vault_url: str, vault_token: str, mount_point: str = "secret"):
+        self.client = hvac.Client(url=vault_url, token=vault_token)
+        self.mount_point = mount_point
+    
+    async def get_secret(self, key: str) -> Optional[str]:
+        try:
+            response = self.client.secrets.kv.v2.read_secret_version(
+                path=f"mcp-hub/{key}",
+                mount_point=self.mount_point
+            )
+            return response['data']['data'].get('value')
+        except:
+            return None
+    
+    async def get_secrets(self, prefix: str) -> Dict[str, str]:
+        try:
+            response = self.client.secrets.kv.v2.read_secret_version(
+                path=f"mcp-hub/{prefix}",
+                mount_point=self.mount_point
+            )
+            return response['data']['data']
+        except:
+            return {}
+```
+
+## Summary of Differences
+
+1. **uvx_options**: Controls how UVX itself runs (Python version, package indexes, caching)
+2. **environment_variables**: Sets up the environment for the package to run in
+3. **package_arguments**: Command-line arguments passed to the package's entry point
+4. **runtime_arguments**: Raw arguments appended to the end of the command
+
+This design provides:
+- **Flexibility**: Support for complex configurations
+- **Security**: Multiple ways to handle secrets
+- **Portability**: Works in local dev, Docker, and K8s
+- **Simplicity**: Can still use simple configs for basic cases
