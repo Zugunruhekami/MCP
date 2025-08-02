@@ -4206,3 +4206,254 @@ servers:
 6. **Python version handling**: Built into PackageConfig with file reading support
 
 This design is much cleaner and easier to understand while still supporting all the required features!
+
+
+
+
+
+
+
+
+
+You're absolutely right! Let me clarify these design issues:
+
+## 1. Python Version Should Be UVX-Specific
+
+```python
+# src/mcp_hub/config/models/package.py
+
+from typing import Optional, List, Dict, Any
+from pydantic import Field
+
+from .base import BaseConfig
+from .transport import TransportConfig
+
+
+class PackageConfig(BaseConfig):
+    """Universal package configuration"""
+    # Package identification
+    name: str
+    version: Optional[str] = "latest"
+    registry: str = "uvx"  # uvx, npm, pypi
+    
+    # Execution
+    entry_point: Optional[str] = None
+    command_override: Optional[List[str]] = None
+    
+    # Transport
+    transport: TransportConfig = Field(default_factory=TransportConfig)
+    
+    # Arguments
+    args: List[str] = Field(default_factory=list)
+    
+    # Environment
+    env: Dict[str, str] = Field(default_factory=dict)
+    
+    # Registry-specific options
+    registry_options: Dict[str, Any] = Field(default_factory=dict)
+    # For uvx: {"python_version": "3.11", "python_from_file": ".python-version"}
+    # For npm: {"global": true, "registry": "https://custom.registry.com"}
+```
+
+## 2. BaseConfig Explanation
+
+The inner `Config` class is Pydantic's way of configuring model behavior:
+
+```python
+# src/mcp_hub/config/models/base.py
+
+class BaseConfig(BaseModel):
+    """Base configuration with environment variable substitution"""
+    
+    class Config:
+        # This tells Pydantic to allow fields not defined in the model
+        extra = "allow"  
+        # Other options: "forbid" (raise error), "ignore" (silently ignore)
+    
+    def __init__(self, **data):
+        # BEFORE Pydantic validation, substitute env vars
+        data = substitute_env_vars(data)
+        super().__init__(**data)
+```
+
+## 3. How `substitute_env_vars` Works - Complete Example
+
+Let me show you exactly how `${JIRA_TOKEN}` flows through the system:
+
+```python
+# src/mcp_hub/config/parser.py
+
+import os
+import re
+from typing import Any
+
+def substitute_env_vars(data: Any) -> Any:
+    """Recursively substitute ${VAR} with environment variables"""
+    if isinstance(data, dict):
+        return {k: substitute_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [substitute_env_vars(item) for item in data]
+    elif isinstance(data, str):
+        def replacer(match):
+            var_name = match.group(1)  # Gets "JIRA_TOKEN" from "${JIRA_TOKEN}"
+            value = os.environ.get(var_name)
+            if value is None:
+                # If not found, return original ${JIRA_TOKEN}
+                return match.group(0)
+            return value
+        # This regex finds ${ANYTHING} patterns
+        return re.sub(r'\$\{([^}]+)\}', replacer, data)
+    else:
+        return data
+
+# Example usage:
+os.environ['JIRA_TOKEN'] = 'secret-token-123'
+config_data = {
+    'env': {
+        'JIRA_API_TOKEN': '${JIRA_TOKEN}',  # Will become 'secret-token-123'
+        'JIRA_URL': 'https://company.atlassian.net'
+    },
+    'args': ['--token', '${JIRA_TOKEN}']  # Will become ['--token', 'secret-token-123']
+}
+result = substitute_env_vars(config_data)
+```
+
+## 4. Complete JIRA Example
+
+Here's how to make `${JIRA_TOKEN}` work end-to-end:
+
+### Step 1: Set Environment Variable
+
+```bash
+# .env.local
+JIRA_TOKEN=your-actual-jira-token-here
+JIRA_URL=https://company.atlassian.net
+```
+
+### Step 2: servers.yaml Configuration
+
+```yaml
+servers:
+  - id: "jira"
+    name: "JIRA Integration"
+    package:
+      name: "mcp-server-jira"
+      registry: "uvx"
+      # These environment variables will be set for the subprocess
+      env:
+        JIRA_API_TOKEN: "${JIRA_TOKEN}"  # Substituted before subprocess starts
+        JIRA_URL: "${JIRA_URL}"
+      # These arguments are passed to the command line
+      args: 
+        - "--token"
+        - "${JIRA_TOKEN}"  # Also substituted
+        - "--project"
+        - "MYPROJ"
+      # UVX-specific options
+      registry_options:
+        python_from_file: ".python-version"
+```
+
+### Step 3: How It's Processed
+
+```python
+# When the config is loaded:
+
+# 1. YAML is parsed into dict
+raw_config = {
+    'id': 'jira',
+    'package': {
+        'env': {
+            'JIRA_API_TOKEN': '${JIRA_TOKEN}',  # Still a string
+            'JIRA_URL': '${JIRA_URL}'
+        },
+        'args': ['--token', '${JIRA_TOKEN}', '--project', 'MYPROJ']
+    }
+}
+
+# 2. BaseConfig.__init__ calls substitute_env_vars
+# After substitution:
+processed_config = {
+    'id': 'jira',
+    'package': {
+        'env': {
+            'JIRA_API_TOKEN': 'your-actual-jira-token-here',  # Substituted!
+            'JIRA_URL': 'https://company.atlassian.net'
+        },
+        'args': ['--token', 'your-actual-jira-token-here', '--project', 'MYPROJ']
+    }
+}
+
+# 3. The loader builds the command
+cmd = ['uvx', 'mcp-server-jira', '--token', 'your-actual-jira-token-here', '--project', 'MYPROJ']
+
+# 4. The loader sets environment for subprocess
+env = os.environ.copy()
+env.update({
+    'JIRA_API_TOKEN': 'your-actual-jira-token-here',
+    'JIRA_URL': 'https://company.atlassian.net'
+})
+
+# 5. ProxyClient runs the command with the environment
+proxy_client = ProxyClient(cmd, env=env)
+```
+
+## 5. Updated UVX Loader with Registry Options
+
+```python
+# src/mcp_hub/loaders/uvx.py
+
+from typing import List, Optional
+from pathlib import Path
+from .base_package import BasePackageLoader
+
+
+class UVXLoader(BasePackageLoader):
+    """Loader for UVX packages"""
+    
+    def get_run_command(self, package_name: str, entry_point: Optional[str]) -> List[str]:
+        """Get uvx run command"""
+        cmd = ["uvx"]
+        
+        # Handle Python version from registry_options
+        if hasattr(self, '_current_package'):
+            options = self._current_package.registry_options
+            
+            # Python version handling
+            python_version = options.get('python_version')
+            if not python_version and options.get('python_from_file'):
+                version_file = Path(options['python_from_file'])
+                if version_file.exists():
+                    python_version = version_file.read_text().strip()
+            
+            if python_version:
+                cmd.extend(["--python", python_version])
+        
+        # Add package with version
+        version = getattr(self, '_current_package', {}).version
+        if version and version != "latest":
+            cmd.append(f"{package_name}=={version}")
+        else:
+            cmd.append(package_name)
+        
+        # Add entry point if specified
+        if entry_point:
+            cmd.append(entry_point)
+        
+        return cmd
+    
+    async def load(self, config):
+        """Override to store current package for command building"""
+        self._current_package = config.package
+        return await super().load(config)
+```
+
+## 6. Summary of the Flow
+
+1. **Environment Setup**: Variables are set in `.env` file or system environment
+2. **YAML Config**: Uses `${VAR}` syntax where you want substitution
+3. **Loading**: When config is loaded, `substitute_env_vars` replaces all `${VAR}` with actual values
+4. **Command Building**: The substituted values are used to build the command
+5. **Execution**: ProxyClient runs the command with the prepared environment
+
+The key insight is that `substitute_env_vars` runs **before** Pydantic validation, so by the time the config objects are created, all `${VAR}` patterns have already been replaced with actual values from the environment.
