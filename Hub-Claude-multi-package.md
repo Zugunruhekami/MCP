@@ -2664,3 +2664,929 @@ This design provides:
 - **Security**: Multiple ways to handle secrets
 - **Portability**: Works in local dev, Docker, and K8s
 - **Simplicity**: Can still use simple configs for basic cases
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*Thinking...*
+
+> The user is asking about the differences between package_arguments, environment_variables, uvx_options, and runtime_arguments in the PackageInfo model, and wants detailed implementation and instructions for both local development (PyCharm) and production deployment (Docker, etc.) with proper secret handling.
+> 
+> Let me break down what each of these configuration types should do:
+> 
+> 1. **uvx_options**: These are options that control how UVX itself behaves - things like Python version constraints, package indexes, caching behavior, etc. These are passed directly to the `uvx` command before the package name.
+> 
+> 2. **environment_variables**: These set up the environment that the package will run in. They're not part of the command line, but rather environment variables that the package can access when it runs.
+> 
+> 3. **package_arguments**: These are command-line arguments that get passed to the specific package after it's been installed and is being executed. These go after the package name in the command.
+> 
+> 4. **runtime_arguments**: These would be additional raw arguments that get appended to the very end of the command, giving maximum flexibility.
+> 
+> The user also wants to handle:
+> - Reading Python version from .python-version file
+> - Environment variable substitution like ${JIRA_TOKEN}
+> - Local development setup in PyCharm
+> - Production deployment with Docker
+> - Secret management without AWS
+> 
+> I should provide a comprehensive implementation that shows:
+> 1. Clear model definitions with proper hierarchy
+> 2. Advanced UVX loader that handles all these cases
+> 3. Secret management system
+> 4. Configuration examples
+> 5. Development setup instructions
+> 6. Production deployment options
+> 
+> Let me structure this response to be practical and detailed.
+
+I'll explain the differences between these configuration levels and provide a comprehensive implementation with proper secret handling for development and production.
+
+## Understanding Configuration Hierarchy
+
+The four configuration types serve different purposes in the command execution pipeline:
+
+**Command Flow**: `uvx [uvx_options] package_name [package_arguments] [runtime_arguments]`
+
+### 1. Configuration Type Differences
+
+```python
+# src/mcp_hub/models/package.py
+
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, validator
+import os
+from pathlib import Path
+import re
+
+
+class UvxOptions(BaseModel):
+    """Controls UVX behavior itself (before package execution)"""
+    python: Optional[str] = None                    # --python 3.11
+    python_from_file: Optional[str] = None          # Read from .python-version
+    no_cache: bool = False                          # --no-cache
+    force_reinstall: bool = False                   # --force-reinstall
+    index_url: Optional[str] = None                 # --index-url
+    extra_index_url: Optional[List[str]] = None     # --extra-index-url
+    isolated: bool = False                          # --isolated
+    
+    def resolve_python_version(self, project_root: Path) -> Optional[str]:
+        """Resolve Python version from file or direct specification"""
+        if self.python:
+            return self.python
+        if self.python_from_file:
+            version_file = project_root / self.python_from_file
+            if version_file.exists():
+                return version_file.read_text().strip()
+        return None
+
+
+class EnvironmentVariable(BaseModel):
+    """Environment variables for the package runtime"""
+    name: str
+    value: Optional[str] = None          # Direct value
+    default: Optional[str] = None        # Default if not found
+    required: bool = False               # Fail if missing
+    secret: bool = False                 # Mark as sensitive
+    
+    def resolve_value(self, env_context: Dict[str, str]) -> Optional[str]:
+        """Resolve the actual value with variable substitution"""
+        if self.value is not None:
+            return self._expand_variables(self.value, env_context)
+        
+        # Check environment
+        if self.name in env_context:
+            return env_context[self.name]
+        
+        # Use default with variable expansion
+        if self.default is not None:
+            return self._expand_variables(self.default, env_context)
+        
+        if self.required:
+            raise ValueError(f"Required environment variable '{self.name}' not found")
+        
+        return None
+    
+    def _expand_variables(self, value: str, env_context: Dict[str, str]) -> str:
+        """Expand ${VAR} and $VAR references"""
+        def replacer(match):
+            var_name = match.group(1) or match.group(2)
+            if var_name in env_context:
+                return env_context[var_name]
+            # Try with MCP_SECRET_ prefix for secrets
+            secret_key = f"MCP_SECRET_{var_name}"
+            if secret_key in env_context:
+                return env_context[secret_key]
+            return match.group(0)  # Return original if not found
+        
+        # Match both ${VAR} and $VAR patterns
+        pattern = r'\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)'
+        return re.sub(pattern, replacer, value)
+
+
+class PackageArgument(BaseModel):
+    """Command-line arguments passed to the package"""
+    name: str
+    value: Optional[str] = None
+    type: str = "option"  # "option", "flag", "positional"
+    condition: Optional[str] = None  # Only add if condition is met
+    
+    def to_command_args(self, env_context: Dict[str, str]) -> List[str]:
+        """Convert to command line arguments"""
+        # Check condition
+        if self.condition and not self._evaluate_condition(self.condition, env_context):
+            return []
+        
+        # Expand variables in value
+        resolved_value = None
+        if self.value:
+            resolved_value = self._expand_variables(self.value, env_context)
+        
+        if self.type == "positional":
+            return [resolved_value] if resolved_value else []
+        elif self.type == "flag":
+            return [f"--{self.name}"] if resolved_value != "false" else []
+        else:  # option
+            if resolved_value:
+                return [f"--{self.name}", resolved_value]
+            return [f"--{self.name}"]
+    
+    def _expand_variables(self, value: str, env_context: Dict[str, str]) -> str:
+        """Same variable expansion as EnvironmentVariable"""
+        def replacer(match):
+            var_name = match.group(1) or match.group(2)
+            return env_context.get(var_name, match.group(0))
+        
+        pattern = r'\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)'
+        return re.sub(pattern, replacer, value)
+    
+    def _evaluate_condition(self, condition: str, env_context: Dict[str, str]) -> bool:
+        """Simple condition evaluation (e.g., "DEBUG=true")"""
+        if "=" in condition:
+            var, expected = condition.split("=", 1)
+            return env_context.get(var.strip()) == expected.strip()
+        return bool(env_context.get(condition))
+
+
+class PackageInfo(BaseModel):
+    """Complete package configuration"""
+    registry_name: str = "uvx"
+    name: str                                       # Package name
+    version: Optional[str] = None                   # Package version
+    entry_point: Optional[str] = None               # Specific entry point
+    
+    # Configuration layers
+    uvx_options: Optional[UvxOptions] = None                           # UVX behavior
+    environment_variables: List[EnvironmentVariable] = Field(default_factory=list)  # Environment setup
+    package_arguments: List[PackageArgument] = Field(default_factory=list)         # Package CLI args
+    runtime_arguments: List[str] = Field(default_factory=list)                     # Raw final args
+```
+
+## Advanced UVX Loader Implementation
+
+```python
+# src/mcp_hub/loaders/implementations/uvx_advanced.py
+
+import asyncio
+import logging
+import os
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from pathlib import Path
+
+from fastmcp import FastMCP
+from fastmcp.server.proxy import ProxyClient
+
+from ...core.interfaces import IServerLoader
+from ...core.models import LoaderType
+from ...secrets import SecretManager
+from ...models.package import PackageInfo
+from ..base import LoadResult
+
+logger = logging.getLogger(__name__)
+
+
+class AdvancedUVXLoader(IServerLoader):
+    """Advanced UVX loader with comprehensive configuration support"""
+    
+    def __init__(self, project_root: Optional[Path] = None, 
+                 secret_manager: Optional[SecretManager] = None):
+        self.project_root = project_root or Path.cwd()
+        self.secret_manager = secret_manager
+    
+    def get_loader_type(self) -> LoaderType:
+        return LoaderType.UVX
+    
+    async def validate_config(self, config: Dict[str, Any]) -> bool:
+        """Validate UVX configuration"""
+        if 'connection' not in config:
+            return False
+        
+        connection = config['connection']
+        if isinstance(connection, str):
+            return bool(connection.strip())
+        elif isinstance(connection, dict):
+            return bool(connection.get('name'))
+        
+        return False
+    
+    async def load(self, config: Dict[str, Any]) -> LoadResult:
+        """Load UVX package with full configuration support"""
+        try:
+            # Parse connection config
+            package_info = self._parse_connection(config['connection'])
+            
+            # Prepare environment with secrets
+            env_context = await self._prepare_environment_context(package_info, config)
+            
+            # Build command
+            cmd = self._build_command(package_info, env_context)
+            
+            # Filter environment for subprocess
+            subprocess_env = self._prepare_subprocess_environment(package_info, env_context)
+            
+            logger.info(f"Loading UVX package: {' '.join(cmd)}")
+            logger.debug(f"Environment variables: {list(subprocess_env.keys())}")
+            
+            # Create proxy client
+            proxy_client = ProxyClient(cmd, env=subprocess_env)
+            
+            # Create proxy server
+            proxy_name = config.get('name', f"{package_info.name} (UVX)")
+            proxy_server = FastMCP.as_proxy(proxy_client, name=proxy_name)
+            
+            return LoadResult(
+                success=True,
+                app=proxy_server.get_asgi_app(),
+                mcp_instance=proxy_server,
+                connection_info={
+                    "type": "uvx",
+                    "package": package_info.name,
+                    "version": package_info.version,
+                    "command": cmd,
+                    "env_vars": [var.name for var in package_info.environment_variables]
+                },
+                loaded_at=datetime.utcnow()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load UVX package: {e}")
+            return LoadResult(success=False, error=str(e))
+    
+    def _parse_connection(self, connection: Any) -> PackageInfo:
+        """Parse connection config into PackageInfo"""
+        if isinstance(connection, str):
+            # Simple package name
+            return PackageInfo(name=connection)
+        elif isinstance(connection, dict):
+            # Full configuration
+            return PackageInfo(**connection)
+        else:
+            raise ValueError(f"Invalid connection type: {type(connection)}")
+    
+    async def _prepare_environment_context(self, package_info: PackageInfo, 
+                                         config: Dict[str, Any]) -> Dict[str, str]:
+        """Prepare complete environment context for variable resolution"""
+        # Start with system environment
+        env_context = os.environ.copy()
+        
+        # Add config-level environment
+        if 'env' in config:
+            env_context.update(config['env'])
+        
+        # Load secrets if available
+        if self.secret_manager:
+            server_id = config.get('id', package_info.name.replace('/', '-'))
+            secrets = await self.secret_manager.get_secrets(server_id)
+            
+            # Add secrets with MCP_SECRET_ prefix
+            for key, value in secrets.items():
+                env_context[f"MCP_SECRET_{key.upper()}"] = value
+                # Also add without prefix for convenience
+                env_context[key.upper()] = value
+        
+        return env_context
+    
+    def _prepare_subprocess_environment(self, package_info: PackageInfo, 
+                                      env_context: Dict[str, str]) -> Dict[str, str]:
+        """Prepare environment variables for subprocess"""
+        subprocess_env = os.environ.copy()
+        
+        # Process each environment variable
+        for env_var in package_info.environment_variables:
+            value = env_var.resolve_value(env_context)
+            if value is not None:
+                subprocess_env[env_var.name] = value
+                if env_var.secret:
+                    logger.debug(f"Set secret environment variable: {env_var.name}")
+                else:
+                    logger.debug(f"Set environment variable: {env_var.name}={value}")
+        
+        return subprocess_env
+    
+    def _build_command(self, package_info: PackageInfo, env_context: Dict[str, str]) -> List[str]:
+        """Build complete UVX command"""
+        cmd = ["uvx"]
+        
+        # Add UVX options
+        if package_info.uvx_options:
+            uvx_args = self._build_uvx_args(package_info.uvx_options)
+            cmd.extend(uvx_args)
+        
+        # Add package with version
+        package_spec = package_info.name
+        if package_info.version and package_info.version != "latest":
+            package_spec = f"{package_info.name}=={package_info.version}"
+        cmd.append(package_spec)
+        
+        # Add entry point
+        if package_info.entry_point:
+            cmd.append(package_info.entry_point)
+        
+        # Add package arguments
+        for arg in package_info.package_arguments:
+            cmd.extend(arg.to_command_args(env_context))
+        
+        # Add runtime arguments
+        cmd.extend(package_info.runtime_arguments)
+        
+        return cmd
+    
+    def _build_uvx_args(self, uvx_options: UvxOptions) -> List[str]:
+        """Build UVX-specific arguments"""
+        args = []
+        
+        # Python version
+        python_version = uvx_options.resolve_python_version(self.project_root)
+        if python_version:
+            args.extend(["--python", python_version])
+        
+        # Boolean flags
+        if uvx_options.no_cache:
+            args.append("--no-cache")
+        if uvx_options.force_reinstall:
+            args.append("--force-reinstall")
+        if uvx_options.isolated:
+            args.append("--isolated")
+        
+        # Index URLs
+        if uvx_options.index_url:
+            args.extend(["--index-url", uvx_options.index_url])
+        if uvx_options.extra_index_url:
+            for url in uvx_options.extra_index_url:
+                args.extend(["--extra-index-url", url])
+        
+        return args
+```
+
+## Secret Management System
+
+```python
+# src/mcp_hub/secrets/manager.py
+
+import os
+import json
+import yaml
+from typing import Dict, Optional, Any, List
+from pathlib import Path
+from abc import ABC, abstractmethod
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SecretProvider(ABC):
+    @abstractmethod
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        pass
+
+
+class EnvironmentSecretProvider(SecretProvider):
+    """Load secrets from environment variables with MCP_SECRET_ prefix"""
+    
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        secrets = {}
+        prefix = f"MCP_SECRET_{server_id.upper().replace('-', '_')}_"
+        
+        for key, value in os.environ.items():
+            if key.startswith(prefix):
+                secret_name = key[len(prefix):].lower()
+                secrets[secret_name] = value
+        
+        return secrets
+
+
+class DotEnvSecretProvider(SecretProvider):
+    """Load secrets from .env files"""
+    
+    def __init__(self, env_files: List[str] = None):
+        self.env_files = env_files or ['.env', '.env.local', '.env.secrets']
+        self._cache: Optional[Dict[str, str]] = None
+    
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        all_secrets = await self._load_all_env()
+        
+        # Look for server-specific secrets
+        secrets = {}
+        prefix = f"{server_id.upper().replace('-', '_')}_"
+        
+        for key, value in all_secrets.items():
+            if key.startswith(prefix):
+                secret_name = key[len(prefix):].lower()
+                secrets[secret_name] = value
+        
+        return secrets
+    
+    async def _load_all_env(self) -> Dict[str, str]:
+        if self._cache is not None:
+            return self._cache
+        
+        secrets = {}
+        for env_file in self.env_files:
+            env_path = Path(env_file)
+            if env_path.exists():
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            secrets[key.strip()] = value.strip().strip('"\'')
+        
+        self._cache = secrets
+        return secrets
+
+
+class FileSecretProvider(SecretProvider):
+    """Load secrets from YAML/JSON files"""
+    
+    def __init__(self, secrets_dir: Path = None):
+        self.secrets_dir = secrets_dir or Path('secrets')
+    
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        secrets = {}
+        
+        # Look for server-specific secret files
+        for suffix in ['.yaml', '.yml', '.json']:
+            secret_file = self.secrets_dir / f"{server_id}{suffix}"
+            if secret_file.exists():
+                with open(secret_file) as f:
+                    if suffix == '.json':
+                        file_secrets = json.load(f)
+                    else:
+                        file_secrets = yaml.safe_load(f)
+                    
+                    if isinstance(file_secrets, dict):
+                        secrets.update(file_secrets)
+        
+        return secrets
+
+
+class SecretManager:
+    """Manage secrets from multiple providers"""
+    
+    def __init__(self, providers: Optional[List[SecretProvider]] = None):
+        self.providers = providers or [
+            EnvironmentSecretProvider(),
+            DotEnvSecretProvider(),
+            FileSecretProvider(),
+        ]
+    
+    async def get_secrets(self, server_id: str) -> Dict[str, str]:
+        """Get all secrets for a server from all providers"""
+        all_secrets = {}
+        
+        for provider in self.providers:
+            try:
+                provider_secrets = await provider.get_secrets(server_id)
+                all_secrets.update(provider_secrets)
+            except Exception as e:
+                logger.warning(f"Error loading secrets from {provider.__class__.__name__}: {e}")
+        
+        return all_secrets
+```
+
+## Configuration Examples
+
+### servers.yaml
+
+```yaml
+servers:
+  # Simple UVX package
+  - id: "memory-server"
+    name: "Memory Assistant"
+    loader_type: "uvx"
+    connection: "@modelcontextprotocol/server-memory"
+  
+  # Complex JIRA server with all configuration types
+  - id: "jira-server"
+    name: "JIRA Integration"
+    loader_type: "uvx"
+    connection:
+      name: "mcp-server-jira"
+      version: "1.2.0"
+      
+      # UVX options (control UVX behavior)
+      uvx_options:
+        python_from_file: ".python-version"  # Read Python version from file
+        no_cache: false
+        index_url: "https://pypi.org/simple"
+        
+      # Environment variables (for package runtime)
+      environment_variables:
+        - name: "JIRA_URL"
+          value: "https://company.atlassian.net"
+        - name: "JIRA_TOKEN"
+          value: "${JIRA_TOKEN}"  # From environment/secrets
+          secret: true
+          required: true
+        - name: "JIRA_USER"
+          default: "${USER}@company.com"
+        - name: "LOG_LEVEL"
+          default: "INFO"
+          
+      # Package arguments (passed to the package)
+      package_arguments:
+        - name: "project"
+          value: "MYPROJ"
+          type: "option"
+        - name: "cache-dir"
+          value: "/tmp/jira-cache"
+          type: "option"
+        - name: "verbose"
+          type: "flag"
+          condition: "DEBUG=true"  # Only add if DEBUG=true
+          
+      # Runtime arguments (appended at end)
+      runtime_arguments: ["--enable-webhooks"]
+  
+  # Confluence with file-based secrets
+  - id: "confluence-server"
+    name: "Confluence Wiki"
+    loader_type: "uvx"
+    connection:
+      name: "mcp-confluence"
+      environment_variables:
+        - name: "CONFLUENCE_TOKEN"
+          value: "${CONFLUENCE_TOKEN}"
+          secret: true
+          required: true
+        - name: "CONFLUENCE_SPACE"
+          value: "TECH"
+      package_arguments:
+        - name: "space"
+          value: "${CONFLUENCE_SPACE}"
+          type: "option"
+```
+
+## Development Setup
+
+### PyCharm Configuration
+
+#### 1. Create .env.local (git-ignored)
+```bash
+# .env.local
+JIRA_TOKEN=your-actual-jira-token-here
+CONFLUENCE_TOKEN=your-confluence-token
+MCP_SECRET_JIRA_SERVER_TOKEN=your-jira-token
+MCP_SECRET_CONFLUENCE_SERVER_TOKEN=your-confluence-token
+
+# Development settings
+DEBUG=true
+LOG_LEVEL=DEBUG
+USER=john.doe
+```
+
+#### 2. PyCharm Run Configuration
+```xml
+<!-- In .idea/runConfigurations/MCP_Hub_Dev.xml -->
+<configuration name="MCP Hub Dev" type="PythonConfigurationType">
+  <module name="mcp-hub" />
+  <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/mcp_hub/__main__.py" />
+  <option name="PARAMETERS" value="run --config config/config.yaml --servers config/servers.yaml" />
+  <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+  <envs>
+    <env name="PYTHONPATH" value="$PROJECT_DIR$/src" />
+    <env name="MCP_ENV" value="development" />
+  </envs>
+  <option name="ENV_FILE" value="$PROJECT_DIR$/.env.local" />
+</configuration>
+```
+
+#### 3. Project Structure
+```
+mcp-hub/
+├── .python-version              # 3.11.5
+├── .env.local                   # Development secrets (git-ignored)
+├── .env.example                 # Example environment file
+├── secrets/                     # Secret files (git-ignored)
+│   ├── jira-server.yaml
+│   └── confluence-server.yaml
+├── config/
+│   ├── config.yaml
+│   └── servers.yaml
+└── src/mcp_hub/
+```
+
+## Production Deployment
+
+### Docker Setup
+
+#### Dockerfile
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Copy Python version file
+COPY .python-version .
+
+# Install Python dependencies
+COPY pyproject.toml .
+RUN pip install -e . && pip install uvx
+
+# Copy application
+COPY src/ src/
+COPY config/ config/
+
+# Create directories
+RUN mkdir -p secrets logs && \
+    useradd -m -u 1000 mcp && \
+    chown -R mcp:mcp /app
+
+USER mcp
+EXPOSE 8000
+
+CMD ["python", "-m", "mcp_hub", "run"]
+```
+
+#### docker-compose.yml
+```yaml
+version: '3.8'
+
+services:
+  mcp-hub:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MCP_ENV: production
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config:/app/config:ro
+      - ./secrets:/app/secrets:ro
+      - /tmp/mcp-cache:/tmp/cache
+    env_file:
+      - .env.production  # Production environment variables
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+#### .env.production
+```bash
+# .env.production (encrypted or secured)
+MCP_SECRET_JIRA_SERVER_TOKEN=prod-jira-token
+MCP_SECRET_CONFLUENCE_SERVER_TOKEN=prod-confluence-token
+JIRA_URL=https://company.atlassian.net
+CONFLUENCE_URL=https://company.atlassian.net/wiki
+```
+
+### Alternative: Using Docker Secrets
+
+#### docker-compose.secrets.yml
+```yaml
+version: '3.8'
+
+services:
+  mcp-hub:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MCP_ENV: production
+    secrets:
+      - jira_token
+      - confluence_token
+    volumes:
+      - ./config:/app/config:ro
+    command: >
+      sh -c '
+        export MCP_SECRET_JIRA_SERVER_TOKEN=$$(cat /run/secrets/jira_token)
+        export MCP_SECRET_CONFLUENCE_SERVER_TOKEN=$$(cat /run/secrets/confluence_token)
+        python -m mcp_hub run
+      '
+
+secrets:
+  jira_token:
+    file: ./secrets/jira_token.txt
+  confluence_token:
+    file: ./secrets/confluence_token.txt
+```
+
+### Kubernetes Deployment
+
+#### k8s-secrets.yaml
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-secrets
+type: Opaque
+data:
+  jira-token: <base64-encoded-token>
+  confluence-token: <base64-encoded-token>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-hub
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: mcp-hub
+        image: mcp-hub:latest
+        env:
+        - name: MCP_SECRET_JIRA_SERVER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: jira-token
+        - name: MCP_SECRET_CONFLUENCE_SERVER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: confluence-token
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: mcp-config
+```
+
+## Best Practices Summary
+
+1. **uvx_options**: Configure UVX behavior (Python version, caching, indexes)
+2. **environment_variables**: Set up package runtime environment with secret support
+3. **package_arguments**: Pass structured arguments to the package with conditions
+4. **runtime_arguments**: Raw arguments for maximum flexibility
+
+This architecture provides:
+- **Security**: Multiple secret providers with proper isolation
+- **Flexibility**: Support for complex configurations and conditionals
+- **Development**: Easy local setup with PyCharm integration
+- **Production**: Multiple deployment options (Docker, K8s) with proper secret handling
+- **Maintainability**: Clear separation of concerns and configuration layers
+
+
+
+
+
+
+
+
+
+
+Looking at these two Poe conversation links, here are the notable differences between the Claude-Opus-4 and Claude-Sonnet-4-Reasoning responses:
+
+## 1. **Response Style**
+
+**Claude-Sonnet-4-Reasoning**:
+- Shows its reasoning process explicitly with "*Thinking...*" section
+- Breaks down the user's requirements in detail before answering
+- More transparent about its thought process
+
+**Claude-Opus-4**:
+- Jumps directly into the solution
+- No visible reasoning process
+- More concise and direct approach
+
+## 2. **Code Organization Differences**
+
+### Model Definitions
+
+**Claude-Sonnet-4-Reasoning** includes additional features:
+```python
+class UvxOptions(BaseModel):
+    isolated: bool = False  # Additional flag not in Opus version
+    
+    def resolve_python_version(self, project_root: Path) -> Optional[str]:
+        # More explicit method naming
+```
+
+**Claude-Opus-4** has simpler implementation:
+```python
+class UvxOptions(BaseModel):
+    # No isolated flag
+    # Uses to_args() method directly without separate resolution
+```
+
+### Environment Variable Handling
+
+**Claude-Sonnet-4-Reasoning**:
+```python
+class EnvironmentVariable(BaseModel):
+    secret: bool = False  # Marks sensitive variables
+    
+    def _expand_variables(self, value: str, env_context: Dict[str, str]) -> str:
+        # Handles both ${VAR} and $VAR patterns
+        # Checks MCP_SECRET_ prefix for secrets
+        pattern = r'\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)'
+```
+
+**Claude-Opus-4**:
+```python
+class EnvironmentVariable(BaseModel):
+    from_file: Optional[str] = None  # Read from file option
+    from_env: Optional[str] = None   # Read from different env var
+    
+    def _expand_vars(self, value: str, env: Dict[str, str]) -> str:
+        # Only handles ${VAR} pattern
+        return re.sub(r'\$\{([^}]+)\}', replacer, value)
+```
+
+## 3. **Package Arguments**
+
+**Claude-Sonnet-4-Reasoning** adds:
+- `condition` field for conditional arguments
+- `_evaluate_condition()` method for runtime evaluation
+
+**Claude-Opus-4** uses:
+- `env_var` field to get value from environment variable
+
+## 4. **Secret Management**
+
+Both implement similar secret management systems but with slight differences:
+
+**Claude-Sonnet-4-Reasoning**:
+- More integrated secret handling in environment variable resolution
+- Automatically adds `MCP_SECRET_` prefix
+
+**Claude-Opus-4**:
+- More extensive secret provider implementations
+- Includes placeholder for encryption/decryption
+
+## 5. **Loader Implementation**
+
+**Claude-Sonnet-4-Reasoning** (`AdvancedUVXLoader`):
+```python
+def _parse_connection(self, connection: Any) -> PackageInfo:
+    # Handles both string and dict connections
+    
+async def _prepare_environment_context(...):
+    # Separate context preparation
+    
+def _prepare_subprocess_environment(...):
+    # Filters environment for subprocess
+```
+
+**Claude-Opus-4**:
+- More direct approach without separate parsing methods
+- Less abstraction in environment preparation
+
+## 6. **Configuration Examples**
+
+Both provide similar YAML examples, but **Claude-Sonnet-4-Reasoning** includes:
+- Conditional arguments example (`condition: "DEBUG=true"`)
+- More detailed explanations of when each option applies
+
+## 7. **Documentation Completeness**
+
+**Claude-Opus-4**:
+- More deployment options (includes HashiCorp Vault example)
+- More detailed Docker secrets implementation
+
+**Claude-Sonnet-4-Reasoning**:
+- Better explanation of the command flow
+- Clearer distinction between configuration types
+
+## Summary
+
+The main differences are:
+1. **Transparency**: Sonnet shows its reasoning, Opus doesn't
+2. **Features**: Sonnet adds conditional arguments and secret marking
+3. **Complexity**: Opus includes more deployment options
+4. **Code Style**: Sonnet is more modular with separate methods, Opus is more direct
+
+Both provide comprehensive solutions, but Sonnet-4-Reasoning offers more advanced features for configuration handling while Opus-4 provides more deployment alternatives. The choice between them would depend on whether you need conditional configuration (Sonnet) or more deployment flexibility (Opus).
