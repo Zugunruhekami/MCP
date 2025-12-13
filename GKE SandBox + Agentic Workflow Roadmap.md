@@ -1452,3 +1452,139 @@ Google 在 GKE 裡提供的 "Sandbox" 功能，技術核心是 **gVisor**。
 不要從 GKE Sandbox (gVisor) 開始。對於一個自動化編程項目，**「Agent 能順利調用 Docker」** 是核心需求。
 請採用 **Daytona (管理層) + 獨立 Node Pool (隔離層)** 的策略來平衡功能與安全。
 
+
+---
+
+這是一個非常關鍵的信息。**「擁有 Restabuild」** 是一個巨大的架構優勢。這意味著你的 Agent 不需要承擔「構建生產鏡像」的重任，大大降低了 Sandbox 的複雜度和安全風險。
+
+結合你所有的現狀（GKE、Restabuild、Internal LLM、Node.js Probot），以下是為你量身定做的 **Namek 最佳前進路線（Best Practices Roadmap）**。
+
+-----
+
+### 核心戰略：腦體分離，外包構建
+
+  * **大腦 (Brain):** Namek Worker (Python + OpenHands SDK) —— 負責思考、寫代碼、運行輕量級測試。
+  * **身體 (Body):** GKE Pod (Sidecar 模式) —— 提供運行環境。
+  * **工廠 (Factory):** Restabuild —— 負責 Docker Build & Push（Agent 只負責觸發）。
+
+-----
+
+### 第一階段：架構定型 (The "Sidecar" Pattern)
+
+這是目前在 GKE 上實現最快、阻力最小的方案。
+
+#### 1\. 雙服務設計
+
+不要把所有東西塞進 Node.js。保持 Node.js 輕量化，引入 Python 處理重邏輯。
+
+  * **Service A: Namek Controller (Node.js)**
+
+      * **職責：** 接收 GitHub Webhook、Symphony 消息。
+      * **邏輯：** 收到請求 -\> 驗證權限 -\> 將任務包（Repo URL, Issue ID）推送到 Redis Queue。
+      * **現狀：** 你已經完成了 80%。
+
+  * **Service B: Namek Worker (Python)**
+
+      * **職責：** 從 Redis 取任務 -\> 啟動 OpenHands Agent -\> 寫代碼 -\> 提交代碼。
+      * **核心庫：** `openhands-ai` (SDK), `litellm`。
+
+#### 2\. GKE Pod 設計 (解決 Sandbox 問題)
+
+既然有 Restabuild，你的 Agent **不需要** 在本地 Build 鏡像。它只需要一個能運行 `npm install` 或 `pip install` 的環境來跑**單元測試**即可。
+
+這意味著你**不需要**強依賴 `privileged` 模式的 DinD（除非你需要跑數據庫容器做集成測試）。
+
+**推薦的 Deployment (YAML 片段):**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: namek-worker
+spec:
+  template:
+    spec:
+      containers:
+        # 1. Python Worker (Agent 大腦)
+        - name: worker
+          image: namek-worker-python:latest
+          env:
+            - name: SANDBOX_RUNTIME
+              value: "local" # 關鍵：直接在當前 Pod 裡操作，或者連接 localhost 的 Docker
+        
+        # 2. Headless Chrome (為 Browser-use 準備)
+        - name: chrome
+          image: browserless/chrome:latest
+          ports:
+            - containerPort: 3000
+        
+        # 3. Docker (可選，僅當需要跑集成測試時)
+        # 如果只跑 Unit Test，這個可以不要，安全性大大提升！
+        - name: dind
+          image: docker:dind
+          securityContext:
+            privileged: true # 視公司安全策略而定
+```
+
+-----
+
+### 第二階段：工作流實現 (The Workflow)
+
+這是結合 Restabuild 的最優流程：
+
+1.  **Planning:** OpenHands Agent 讀取 Issue，生成計劃。
+2.  **Coding:** Agent 在 Sandbox (Worker Pod) 內修改代碼。
+3.  **Local Testing:** Agent 運行 `npm test` (單元測試)。
+      * *注意：這是為了快速反饋，不依賴 Docker Build。*
+4.  **Push:** Agent 通過 Git 提交代碼並 Push 到遠端分支。
+5.  **Build Delegation (關鍵一步):**
+      * Agent 檢測到 Push 成功。
+      * Agent 調用 Restabuild API (或者觸發 `build.sh` 的機制)。
+      * Agent **輪詢 (Poll)** Restabuild 的狀態，直到 Build 成功。
+6.  **Visualization (Browser-use):**
+      * 如果是前端項目，Agent 連接 Sidecar 的 Chrome (`localhost:3000`)。
+      * Agent 啟動本地開發服務器 (`npm start`)。
+      * Agent 通過 Chrome 截圖驗證 UI 更改。
+7.  **PR & Review:** Agent 創建 PR，並自我 Review。
+
+-----
+
+### 第三階段：技術選型清單 (The Stack)
+
+為了實現上述路線，請嚴格按照以下工具鏈執行，避免走彎路：
+
+1.  **Agent 框架:** **OpenHands SDK** (Python)。
+      * *理由：* 你需要它的 `Runtime` 抽象和 `LiteLLM` 集成。不要用 LangChain DeepAgents，它對底層環境要求太高，不適合你的現狀。
+2.  **LLM 連接:** **LiteLLM** (已擁有)。
+      * *配置：* 讓 OpenHands 指向 LiteLLM Proxy。
+3.  **瀏覽器交互:** **Browser-use** (Python Library)。
+      * *理由：* 它可以完美集成進 OpenHands 的 Tool 系統，連接 Sidecar Chrome。
+4.  **Sandbox 管理:** **Docker-in-Docker (DinD)** 或 **Daytona**。
+      * *決策：* 現在先用簡單的 **DinD Sidecar**。等你這套流程跑通了，覺得管理多個併發任務很麻煩時，再部署 Daytona 來管理 Pod。
+
+-----
+
+### 具體執行步驟 (Action Plan)
+
+1.  **拆分項目：** 在你的 Repo 裡建一個 `worker/` 目錄，初始化 Python 項目，安裝 `openhands-ai` 和 `browser-use`。
+2.  **配置 GKE：** 修改 YAML，給 Worker Pod 加上 `docker:dind` 和 `browserless/chrome` 兩個 Sidecar。
+3.  **寫第一段代碼：**
+      * 寫一個 Python 腳本，使用 OpenHands `MicroAgent`。
+      * 讓它執行：`git clone <internal-repo>` -\> `修改 README` -\> `git push`。
+4.  **打通 Restabuild：**
+      * 在 Python 腳本裡增加邏輯：Push 後，去檢查 Restabuild 的日誌或狀態。
+5.  **對接 Node.js：**
+      * 讓 Node.js 收到 Webhook 後，發送一個 JSON 到 Redis。
+      * Python Worker 監聽 Redis 並觸發上述腳本。
+
+### 總結
+
+**為什麼這是最優解？**
+
+1.  **避開了 GKE Sandbox (gVisor) 的坑：** 你不需要那麼強的隔離，因為你不在 Agent 裡 Build Docker（Restabuild 做這事）。
+2.  **利用了 OpenHands 的強項：** 使用它的 SDK 來處理複雜的 Coding 邏輯和狀態管理。
+3.  **解決了瀏覽器調試：** 通過 Sidecar 模式引入 Chrome，為未來的 Visual Debugging 鋪平了道路。
+
+**現在就去做：**
+不要去管 DeepAgents 或者 Claude Agent SDK 了。專注於 **Probot (Node) + OpenHands SDK (Python) + Restabuild** 這三者的串聯。這是最符合你公司現狀的落地路徑。
+
