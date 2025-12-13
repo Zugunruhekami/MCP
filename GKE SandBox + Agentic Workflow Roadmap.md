@@ -768,3 +768,687 @@ spec:
 建議下一步： 在 GKE 開發環境中部署一個 OpenHands 實例（使用其 Docker 鏡像），配置好 LiteLLM 指向內部模型，嘗試跑通一個簡單的 GitHub Issue 修復任務。這將是你構建 Namek 最快的起點。
 
 OpenHands - AI Software Engineer Relevance: This video provides a comprehensive visual walkthrough of OpenHands (formerly OpenDevin), demonstrating its runtime architecture, browser interaction capabilities, and self-hosted setup, which directly addresses your need for a GKE-compatible sandbox solution.
+
+
+----
+
+這是一個非常關鍵的架構決策點。針對你的情況（GKE 環境、企業內部、已有的 Node.js 投資），我的核心建議是：
+
+**絕對不要（Absolutely DO NOT）簡單地把 OpenHands 整個項目 Clone/Copy 到你的 Namek Repo 裡面進行填充。**
+
+這會導致你陷入巨大的維護泥潭（Merge Conflict 地獄），並且 OpenHands 的全棧架構（FastAPI + React）會和你現有的架構打架。
+
+你應該採用 **「微服務分離」** 或 **「SDK 集成」** 的模式。考慮到你現有的 Node.js Probot 架構和未來的擴展性，以下是最佳實踐路徑：
+
+-----
+
+### 一、 核心決策：如何集成 OpenHands？
+
+#### 推薦方案：Sidecar / Worker 模式 (使用 OpenHands SDK)
+
+你需要將 `Namek` 拆分為兩個邏輯部分：
+
+1.  **Namek Controller (Node.js - 現有):** 負責輕量級業務，如 Webhook 接收、Symphony/Teams 消息轉發、權限校驗。
+2.  **Namek Worker (Python - 新增):** 負責重型任務。這裡引入 **OpenHands SDK** 作為依賴庫，用來驅動 Sandbox 和 Agent。
+
+**為什麼這樣做？**
+
+  * **解耦：** Probot (Node.js) 在處理 GitHub 事件流方面非常成熟，保留它。OpenHands SDK (Python) 在處理 Agent Runtime 和 LLM 交互上最強，利用它。
+  * **狀態管理：** GitHub Webhooks 是瞬時的，而 Agent Coding 是 Long-running 的。你需要一個異步機制（Queue）來連接這兩者。
+
+-----
+
+### 二、 架構設計：GKE 上的 Namek 2.0
+
+```mermaid
+graph TD
+    subgraph "External / Corporate Tools"
+        User[Symphony / Teams]
+        GHE[GitHub Enterprise]
+        LLM[LiteLLM / Vertex AI]
+    end
+
+    subgraph "Namek Namespace (GKE)"
+        subgraph "Controller Pod (Node.js)"
+            Probot[Probot App]
+            QueueProd[Task Producer]
+        end
+
+        MQ[Redis / PubSub]
+
+        subgraph "Worker Pod (Python)"
+            Worker[Task Consumer]
+            OH_SDK[OpenHands SDK]
+            CustomAgent[Custom Coding Logic]
+        end
+
+        subgraph "Sandbox Infrastructure"
+            DIND[Docker-in-Docker Sidecar]
+            Sandbox1[Agent Sandbox Container]
+            Sandbox2[Agent Sandbox Container]
+        end
+    end
+
+    User --> Probot
+    GHE --Webhook--> Probot
+    Probot --Job--> MQ
+    MQ --Job--> Worker
+    Worker --Uses--> OH_SDK
+    OH_SDK --Create/Exec--> DIND
+    DIND --Spawn--> Sandbox1
+    Sandbox1 --Git/Test--> GHE
+    Worker --Chat/Edit--> LLM
+```
+
+-----
+
+### 三、 具體實施步驟 (Action Plan)
+
+#### 1\. 保留 Node.js 層作為入口 (Controller)
+
+繼續開發你目前的 Node.js App。當收到 `issue_comment` (例如 `/fix this`) 或 `pull_request` 事件時，不要直接在 Node.js 裡處理複雜邏輯，而是將任務 Payload 發送到一個消息隊列（簡單的 Redis 甚至數據庫表都可以）。
+
+#### 2\. 新建 Python 服務集成 OpenHands SDK (Worker)
+
+在同一個 Repo 或新 Repo 中創建一個 Python 項目。
+**不要 Clone 代碼，而是安裝包：**
+*(注：OpenHands 目前正在拆分 SDK，如果官方 PyPI 尚未完全穩定，可以使用 `pip install git+https://github.com/All-Hands-AI/OpenHands.git` 指定 commit)*
+
+編寫你的 `worker.py`：
+
+```python
+import asyncio
+from openhands.core.main import create_runtime
+from openhands.controller.agent import Agent
+from openhands.core.config import AppConfig, SandboxConfig
+
+# 這是你的核心 Worker 邏輯
+async def process_task(repo_url, issue_description, token):
+    # 1. 配置 Runtime (GKE 自研 Sandbox 的關鍵)
+    # OpenHands 默認支持通過 Docker Socket 管理容器
+    config = AppConfig(
+        sandbox=SandboxConfig(
+            runtime="docker",  # 在 GKE Pod 裡連接 DIND Sidecar
+            image="your-company-registry/namek-sandbox-base:latest", # 預裝了 git, python, java 等
+            enable_auto_lint=True
+        ),
+        workspace_base="/workspace",
+    )
+
+    # 2. 創建 Runtime (這一步會自動在 GKE 裡拉起一個隔離容器)
+    runtime = create_runtime(config)
+    await runtime.connect()
+
+    # 3. 初始化 Agent (這裡可以用 OpenHands 內置的，也可以用 LangGraph 自定義)
+    # 關鍵：這裡配置 LiteLLM
+    agent = Agent(
+        llm_config={
+            "model": "vertex_ai/gemini-pro-1.5", # 通過 LiteLLM
+            "base_url": "http://your-internal-litellm-service",
+            "api_key": "sk-internal"
+        }
+    )
+
+    # 4. 執行任務 (Long-running)
+    instruction = f"Checkout {repo_url}. Fix this issue: {issue_description}. Run tests."
+    state = await agent.run(runtime, instruction)
+
+    # 5. 獲取結果並清理
+    print(state.history)
+    await runtime.close()
+
+# 模擬從 Queue 獲取任務
+if __name__ == "__main__":
+    asyncio.run(process_task(...))
+```
+
+#### 3\. 解決 GKE Sandbox 問題 (The "Secret Sauce")
+
+這是最棘手的部分。在 GKE 上，你不能隨便啟動 Docker。你需要配置 **Docker-in-Docker (DinD)** 模式。
+
+在你的 `deployment.yaml` 中，給 Python Worker Pod 添加一個 Sidecar：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: namek-worker
+spec:
+  template:
+    spec:
+      containers:
+        # 你的 Python Worker (運行 OpenHands SDK)
+        - name: worker
+          image: namek-worker:latest
+          env:
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375
+        
+        # DIND Sidecar (OpenHands 通過它來創建 Sandbox)
+        - name: dind
+          image: docker:dind
+          securityContext:
+            privileged: true # 這是必須的，除非使用 Kaniko 等無特權構建，但運行時通常需要 privileged
+            # 如果公司安全策略禁止 privileged，則需要使用 Sysbox 運行時或 GKE Sandbox (gVisor) + 用戶態 Docker
+```
+
+-----
+
+### 四、 回答你的具體困惑
+
+1.  **LangChain DeepAgents vs. OpenHands SDK?**
+
+      * **DeepAgents** 是一個「編排邏輯庫」，它假設你有現成的 Sandbox API (Runloop/Daytona)。如果你用它，你得自己寫代碼去對接 GKE 的 Docker。
+      * **OpenHands SDK** 是一個「全棧能力庫」，它自帶了 `DockerRuntime`。這意味著**它幫你寫好了對接 Docker/GKE 的代碼**。這對你來說價值巨大。
+
+2.  **LiteLLM / Vertex AI 兼容性？**
+
+      * OpenHands 底層完全使用 LiteLLM。這意味著只要 LiteLLM 能連上你們內部的 Vertex AI，OpenHands 就能用。完全不受 Claude Agent SDK 的 beta header 限制。
+      * 你甚至可以配置 OpenHands 使用你們內部的自託管模型（如 Llama 3 on GKE）。
+
+3.  **Claude Agent SDK (原 Claude Code) 還有用嗎？**
+
+      * 暫時忘掉它。它目前對 Anthropic 服務綁定太緊，且在處理「自定義 Sandbox」時不如 OpenHands 靈活。
+
+4.  **GitHub Enterprise 無 Actions 怎麼辦？**
+
+      * 這正是 Sandbox 的用途。你的 Agent 不僅僅是「寫代碼」，它還要在 Sandbox 裡「運行 CI」。
+      * 流程：Agent 改代碼 -\> Agent 在 Sandbox 運行 `npm test` -\> Agent 看到測試通過 -\> Agent 提交 PR。你把 CI/CD 的一部分職責前置到了 Agent 階段。
+
+### 五、 總結建議
+
+1.  **不要 Clone Repo:** 把 OpenHands 當作一個 Python 依賴包（SDK）來使用。
+2.  **雙服務架構:** Node.js (Controller) + Python (Worker w/ OpenHands SDK)。
+3.  **基礎設施:** 在 GKE 上配置 DIND Sidecar，讓 OpenHands SDK 能生成 Sandbox 容器。
+4.  **下一步:** 先在本地（Local Docker）跑通 Python SDK 調用 LiteLLM 完成一個簡單的 `git clone` + `echo hello` 任務，然後再搬到 GKE 上。
+
+---
+這是一個非常關鍵的架構決策點。針對你的情況（GKE 環境、企業內部、已有的 Node.js 投資），我的核心建議是：
+
+**絕對不要（Absolutely DO NOT）簡單地把 OpenHands 整個項目 Clone/Copy 到你的 Namek Repo 裡面進行填充。**
+
+這會導致你陷入巨大的維護泥潭（Merge Conflict 地獄），並且 OpenHands 的全棧架構（FastAPI + React）會和你現有的架構打架。
+
+你應該採用 **「微服務分離」** 或 **「SDK 集成」** 的模式。考慮到你現有的 Node.js Probot 架構和未來的擴展性，以下是最佳實踐路徑：
+
+-----
+
+### 一、 核心決策：如何集成 OpenHands？
+
+#### 推薦方案：Sidecar / Worker 模式 (使用 OpenHands SDK)
+
+你需要將 `Namek` 拆分為兩個邏輯部分：
+
+1.  **Namek Controller (Node.js - 現有):** 負責輕量級業務，如 Webhook 接收、Symphony/Teams 消息轉發、權限校驗。
+2.  **Namek Worker (Python - 新增):** 負責重型任務。這裡引入 **OpenHands SDK** 作為依賴庫，用來驅動 Sandbox 和 Agent。
+
+**為什麼這樣做？**
+
+  * **解耦：** Probot (Node.js) 在處理 GitHub 事件流方面非常成熟，保留它。OpenHands SDK (Python) 在處理 Agent Runtime 和 LLM 交互上最強，利用它。
+  * **狀態管理：** GitHub Webhooks 是瞬時的，而 Agent Coding 是 Long-running 的。你需要一個異步機制（Queue）來連接這兩者。
+
+-----
+
+### 二、 架構設計：GKE 上的 Namek 2.0
+
+```mermaid
+graph TD
+    subgraph "External / Corporate Tools"
+        User[Symphony / Teams]
+        GHE[GitHub Enterprise]
+        LLM[LiteLLM / Vertex AI]
+    end
+
+    subgraph "Namek Namespace (GKE)"
+        subgraph "Controller Pod (Node.js)"
+            Probot[Probot App]
+            QueueProd[Task Producer]
+        end
+
+        MQ[Redis / PubSub]
+
+        subgraph "Worker Pod (Python)"
+            Worker[Task Consumer]
+            OH_SDK[OpenHands SDK]
+            CustomAgent[Custom Coding Logic]
+        end
+
+        subgraph "Sandbox Infrastructure"
+            DIND[Docker-in-Docker Sidecar]
+            Sandbox1[Agent Sandbox Container]
+            Sandbox2[Agent Sandbox Container]
+        end
+    end
+
+    User --> Probot
+    GHE --Webhook--> Probot
+    Probot --Job--> MQ
+    MQ --Job--> Worker
+    Worker --Uses--> OH_SDK
+    OH_SDK --Create/Exec--> DIND
+    DIND --Spawn--> Sandbox1
+    Sandbox1 --Git/Test--> GHE
+    Worker --Chat/Edit--> LLM
+```
+
+-----
+
+### 三、 具體實施步驟 (Action Plan)
+
+#### 1\. 保留 Node.js 層作為入口 (Controller)
+
+繼續開發你目前的 Node.js App。當收到 `issue_comment` (例如 `/fix this`) 或 `pull_request` 事件時，不要直接在 Node.js 裡處理複雜邏輯，而是將任務 Payload 發送到一個消息隊列（簡單的 Redis 甚至數據庫表都可以）。
+
+#### 2\. 新建 Python 服務集成 OpenHands SDK (Worker)
+
+在同一個 Repo 或新 Repo 中創建一個 Python 項目。
+**不要 Clone 代碼，而是安裝包：**
+*(注：OpenHands 目前正在拆分 SDK，如果官方 PyPI 尚未完全穩定，可以使用 `pip install git+https://github.com/All-Hands-AI/OpenHands.git` 指定 commit)*
+
+編寫你的 `worker.py`：
+
+```python
+import asyncio
+from openhands.core.main import create_runtime
+from openhands.controller.agent import Agent
+from openhands.core.config import AppConfig, SandboxConfig
+
+# 這是你的核心 Worker 邏輯
+async def process_task(repo_url, issue_description, token):
+    # 1. 配置 Runtime (GKE 自研 Sandbox 的關鍵)
+    # OpenHands 默認支持通過 Docker Socket 管理容器
+    config = AppConfig(
+        sandbox=SandboxConfig(
+            runtime="docker",  # 在 GKE Pod 裡連接 DIND Sidecar
+            image="your-company-registry/namek-sandbox-base:latest", # 預裝了 git, python, java 等
+            enable_auto_lint=True
+        ),
+        workspace_base="/workspace",
+    )
+
+    # 2. 創建 Runtime (這一步會自動在 GKE 裡拉起一個隔離容器)
+    runtime = create_runtime(config)
+    await runtime.connect()
+
+    # 3. 初始化 Agent (這裡可以用 OpenHands 內置的，也可以用 LangGraph 自定義)
+    # 關鍵：這裡配置 LiteLLM
+    agent = Agent(
+        llm_config={
+            "model": "vertex_ai/gemini-pro-1.5", # 通過 LiteLLM
+            "base_url": "http://your-internal-litellm-service",
+            "api_key": "sk-internal"
+        }
+    )
+
+    # 4. 執行任務 (Long-running)
+    instruction = f"Checkout {repo_url}. Fix this issue: {issue_description}. Run tests."
+    state = await agent.run(runtime, instruction)
+
+    # 5. 獲取結果並清理
+    print(state.history)
+    await runtime.close()
+
+# 模擬從 Queue 獲取任務
+if __name__ == "__main__":
+    asyncio.run(process_task(...))
+```
+
+#### 3\. 解決 GKE Sandbox 問題 (The "Secret Sauce")
+
+這是最棘手的部分。在 GKE 上，你不能隨便啟動 Docker。你需要配置 **Docker-in-Docker (DinD)** 模式。
+
+在你的 `deployment.yaml` 中，給 Python Worker Pod 添加一個 Sidecar：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: namek-worker
+spec:
+  template:
+    spec:
+      containers:
+        # 你的 Python Worker (運行 OpenHands SDK)
+        - name: worker
+          image: namek-worker:latest
+          env:
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375
+        
+        # DIND Sidecar (OpenHands 通過它來創建 Sandbox)
+        - name: dind
+          image: docker:dind
+          securityContext:
+            privileged: true # 這是必須的，除非使用 Kaniko 等無特權構建，但運行時通常需要 privileged
+            # 如果公司安全策略禁止 privileged，則需要使用 Sysbox 運行時或 GKE Sandbox (gVisor) + 用戶態 Docker
+```
+
+-----
+
+### 四、 回答你的具體困惑
+
+1.  **LangChain DeepAgents vs. OpenHands SDK?**
+
+      * **DeepAgents** 是一個「編排邏輯庫」，它假設你有現成的 Sandbox API (Runloop/Daytona)。如果你用它，你得自己寫代碼去對接 GKE 的 Docker。
+      * **OpenHands SDK** 是一個「全棧能力庫」，它自帶了 `DockerRuntime`。這意味著**它幫你寫好了對接 Docker/GKE 的代碼**。這對你來說價值巨大。
+
+2.  **LiteLLM / Vertex AI 兼容性？**
+
+      * OpenHands 底層完全使用 LiteLLM。這意味著只要 LiteLLM 能連上你們內部的 Vertex AI，OpenHands 就能用。完全不受 Claude Agent SDK 的 beta header 限制。
+      * 你甚至可以配置 OpenHands 使用你們內部的自託管模型（如 Llama 3 on GKE）。
+
+3.  **Claude Agent SDK (原 Claude Code) 還有用嗎？**
+
+      * 暫時忘掉它。它目前對 Anthropic 服務綁定太緊，且在處理「自定義 Sandbox」時不如 OpenHands 靈活。
+
+4.  **GitHub Enterprise 無 Actions 怎麼辦？**
+
+      * 這正是 Sandbox 的用途。你的 Agent 不僅僅是「寫代碼」，它還要在 Sandbox 裡「運行 CI」。
+      * 流程：Agent 改代碼 -\> Agent 在 Sandbox 運行 `npm test` -\> Agent 看到測試通過 -\> Agent 提交 PR。你把 CI/CD 的一部分職責前置到了 Agent 階段。
+
+### 五、 總結建議
+
+1.  **不要 Clone Repo:** 把 OpenHands 當作一個 Python 依賴包（SDK）來使用。
+2.  **雙服務架構:** Node.js (Controller) + Python (Worker w/ OpenHands SDK)。
+3.  **基礎設施:** 在 GKE 上配置 DIND Sidecar，讓 OpenHands SDK 能生成 Sandbox 容器。
+4.  **下一步:** 先在本地（Local Docker）跑通 Python SDK 調用 LiteLLM 完成一個簡單的 `git clone` + `echo hello` 任務，然後再搬到 GKE 上。
+
+
+---
+
+這是一個非常務實且涉及到底層運維安全（SecOps）的關鍵問題。在企業級 GKE 環境中，選擇「裸奔的 DinD」還是「管理的 Daytona」，決定了你後續運維的痛苦程度。
+
+以下我為你深度解析 **DinD (Docker-in-Docker)** 的技術門檻，並對比 **Daytona** 方案，最後給出具體的實施步驟。
+
+-----
+
+### 一、 DinD (Docker-in-Docker) 是否需要「特殊技術」？
+
+是的，DinD 在企業環境中有一個巨大的**安全門檻**。
+
+#### 1\. 技術實現的代價：`privileged: true`
+
+要在 Kubernetes Pod 裡面運行 Docker Daemon，你必須在 YAML 中賦予該容器 **特權模式 (Privileged Mode)**。
+
+```yaml
+securityContext:
+  privileged: true  # <--- 這就是最大的阻礙
+```
+
+  * **為什麼這是個問題？**
+      * `privileged: true` 意味著該容器基本上擁有宿主機（Node）的所有權限。如果 Agent 執行的代碼包含惡意腳本並成功逃逸，它能直接控制整個 GKE 節點，甚至橫向移動攻擊其他業務。
+      * **企業合規性：** 大多數銀行或大型企業的 Security Policy **嚴格禁止**在生產環境（甚至開發環境）使用特權容器。
+
+#### 2\. GKE 上的替代方案（如果被 Security 團隊禁止）
+
+如果你的公司禁止 `privileged`，想要實現類似體驗，通常需要引入更複雜的技術：
+
+  * **Kaniko:** 只能用於構建鏡像，不能用於運行 Agent Runtime（不適合你）。
+  * **Sysbox (Nestybox):** 一種特殊的 Container Runtime（runc 的替代品），允許在**不開啟特權模式**的情況下運行 Docker-in-Docker。
+      * *難度：* 需要在 GKE 節點級別安裝組件，需要 GKE 管理員權限。
+
+-----
+
+### 二、 Daytona (Open Source) vs. 自研 DinD：利弊權衡
+
+既然你希望「長期投資」，且需要考慮 GKE 的現實情況，以下是深度對比：
+
+| 比較維度 | 方案 A：自研 DinD (Sidecar) | 方案 B：Daytona (開源版部署在 GKE) |
+| :--- | :--- | :--- |
+| **架構模式** | **「手工作坊」**<br>Agent Pod 自帶 Docker，自己在裡面生殺容器。 | **「工廠流水線」**<br>Agent 調用 Daytona API，Daytona 負責在 GKE 上調度獨立的 Sandbox Pod。 |
+| **GKE 權限** | **高危**<br>Agent Pod 必須是特權容器 (`privileged`)。 | **安全可控**<br>Agent Pod 僅需普通權限。<br>Daytona Server 需要創建 Pod 的權限 (RBAC)。 |
+| **隔離性** | **差**<br>Agent 和 Sandbox 在同一個 Pod 網絡棧中，資源競爭明顯。 | **優**<br>每個 Sandbox 都是獨立的 Pod，資源配額（CPU/Mem）可獨立控制。 |
+| **環境定義** | **手寫 Dockerfile**<br>你需要自己維護 Sandbox 鏡像。 | **DevContainer 標準**<br>直接讀取 Repo 裡的 `.devcontainer.json`，自動配置環境。 |
+| **調試能力** | **困難**<br>需要 kubectl exec 進入容器查看。 | **極強**<br>Daytona 提供 Web URL，你可以直接用瀏覽器或 VS Code Remote 連接進去修 Bug。 |
+| **OpenHands 集成** | **原生支持** (默認 DockerRuntime) | **官方支持** (DaytonaRuntime 插件) |
+
+#### 💡 核心結論：
+
+  * 如果你的團隊**只有你一個人**，且你有權限開 `privileged`，**DinD 最快**。
+  * 如果你要**給團隊其他人用**，或者公司**禁止特權容器**，**Daytona 是唯一正確的長遠選擇**。它幫你解決了「如何在 K8s 上安全地管理開發環境」這個難題。
+
+-----
+
+### 三、 實戰操作指南
+
+#### 路徑一：如果你決定先試試 DinD (快速驗證)
+
+假設你有權限，想快速驗證 OpenHands SDK。
+
+**1. 修改 Deployment YAML (啟用 DinD)**
+在你的 `namek-worker` deployment 中：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: namek-worker
+spec:
+  template:
+    spec:
+      containers:
+        # 1. OpenHands SDK 容器
+        - name: agent
+          image: your-agent-image
+          env:
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375 # 連接 Sidecar
+        # 2. DinD Sidecar
+        - name: dind
+          image: docker:24-dind
+          securityContext:
+            privileged: true # 必須開啟
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: "" # 內網測試關閉 TLS 簡化配置
+```
+
+**2. OpenHands SDK 代碼對接**
+
+```python
+from openhands.core.config import AppConfig, SandboxConfig
+from openhands.core.main import create_runtime
+
+config = AppConfig(
+    sandbox=SandboxConfig(
+        runtime="docker",
+        # 這裡不需要額外配置，因為環境變量 DOCKER_HOST 已經告訴 SDK 去連 Sidecar 了
+    )
+)
+runtime = create_runtime(config)
+```
+
+-----
+
+### 四、 路徑二：部署 Daytona (推薦的長期方案)
+
+這是符合你「長期投資」且「可視化交互」目標的方案。Daytona 會作為基礎設施運行在你的 GKE 上。
+
+#### 1\. 在 GKE 上安裝 Daytona Server
+
+你需要 Helm 或者 Daytona CLI。假設你在公司內部只能用 kubectl。
+
+Daytona 官方提供了 Kubernetes 部署清單。基本流程如下：
+
+```bash
+# 1. 下載 Daytona 服務端 (你需要一個具有 ClusterAdmin 權限的 ServiceAccount)
+# 在本地機器或跳板機上安裝 daytona binary
+(curl -sf -L https://download.daytona.io/daytona/install.sh | sudo bash)
+
+# 2. 初始化 Daytona Server 到 GKE
+# 確保你的 kubectl context 已經切換到你的 GKE 集群
+daytona server install --provider kubernetes-provider
+```
+
+*這一步會在你的 GKE 上創建一個 `daytona` namespace，並部署 Server 和 Provider。它會自動處理創建 Pod 所需的 RBAC。*
+
+#### 2\. 獲取 API Key 和 Endpoint
+
+安裝完成後，Daytona 會暴露一個服務地址（可能是 ClusterIP 或 LoadBalancer，取決於你的 GKE Ingress 配置）。
+你需要生成一個 API Key 供你的 Agent 使用。
+
+```bash
+daytona api-key create --name namek-agent
+# 輸出: dy_xxxxx (保存好這個 Key)
+```
+
+#### 3\. OpenHands SDK 對接 Daytona
+
+在你的 `namek-worker` (Python) 代碼中，不再使用 Docker Runtime，而是 Daytona Runtime。
+
+*注意：目前 OpenHands 的 Daytona 支持主要通過 `event-stream` 或插件形式存在。如果官方 SDK 尚未完全 merge `runtime="daytona"` 的簡化寫法，你可以通過以下邏輯實現（偽代碼示意）：*
+
+```python
+# 在你的 Worker 中使用 Daytona SDK 直接創建 Sandbox
+# pip install daytona-sdk
+from daytona_sdk import Daytona, CreateWorkspaceParams
+
+daytona = Daytona(api_key="dy_xxxx", server_url="http://daytona-server.daytona.svc.cluster.local")
+
+# 1. 根據 Issue 的 Repo 創建 Workspace
+workspace = daytona.create_workspace(
+    params=CreateWorkspaceParams(
+        repository="https://github.com/your-org/target-repo.git",
+        target="gke-provider"
+    )
+)
+
+# 2. 獲取 Sandbox 的執行環境信息
+# Daytona 會返回一個可以 SSH 或通過 API 執行的環境
+print(f"Sandbox ID: {workspace.id}")
+
+# 3. 讓 OpenHands 連接這個遠程環境
+# 這一步通常是通過 SSH 或 OpenHands 的 Remote Runtime 接口
+# 你可以把 Daytona 返回的連接信息傳給 OpenHands
+```
+
+#### 4\. 實現「瀏覽器交互」和「自動 Debug」
+
+這是 Daytona 的殺手鐧。
+
+  * 當 Agent 在 Daytona 創建的 Pod 裡運行 `npm start` 啟動了一個 Web 服務（比如端口 3000）。
+  * Daytona 自動提供一個 URL（例如 `https://3000-workspace-id.daytona.internal`）。
+  * 你可以把這個 URL 餵給 `browser-use` 或者 `chrome-devs-mcp`。
+  * **Agent 視角：** Agent 通過此 URL 訪問自己部署的應用，進行測試。
+  * **人類視角：** 你可以點擊同一個 URL 查看 Agent 做出來的東西。
+
+### 總結建議 (Actionable Advice)
+
+1.  **第一步（驗證）：** 為了不被運維卡住，先在 GKE 上申請一個 **Development Namespace**，嘗試申請 `privileged` 權限。如果批了，先用 **DinD (方案 A)** 跑通整個 `Webhook -> Queue -> Python SDK -> Code Change` 的閉環。這能讓你最快看到成果。
+2.  **第二步（架構）：** 同時開始研究 **Daytona** 的部署。因為你的目標是「自動化編程實踐」和「瀏覽器交互」，Daytona 提供的標準化環境管理和端口轉發功能，是你未來不想自己重寫的一大堆代碼。
+3.  **關於 GKE API：** 你不需要自己去 "Enable GKE API"（那是 Google Cloud Console 層面的事）。你需要的是 **Kubernetes RBAC**。如果選方案 A，你需要 Privileged SecurityContext。如果選方案 B，你需要給 Daytona Server 一個能 Create/Delete Pods 的 ServiceAccount。
+
+**一句話決策：** 先用 DinD 做原型（Prototype），為了長治久安和高級功能（瀏覽器預覽、多人調試），規劃遷移到 Daytona。
+
+
+---
+
+這是一個非常好的問題。這裡存在一個概念上的混淆，我們需要先釐清：
+
+**GKE Sandbox (gVisor)** 本質上是\*\*「一種更安全的容器運行模式」**，而不是一個**「管理 Agent 任務的平台」\*\*。
+
+拿蓋房子做比喻：
+
+  * **Daytona / OpenHands Runtime** 是\*\*「包工頭」\*\*：他知道如何指揮工人搭建廚房、安裝水電（配置環境、拉取代碼）。
+  * **DinD (Docker-in-Docker)** 是\*\*「工具箱」\*\*：工人手裡拿著工具，可以在房子裡再造一個小房子（在容器裡啟動子容器）。
+  * **GKE Sandbox (gVisor)** 是\*\*「防爆墻」\*\*：它規定這個房間的墻壁必須加厚，防止裡面的爆炸（惡意代碼、病毒）炸毀整棟樓（宿主機內核）。
+
+所以，**GKE Sandbox 不是 DinD 或 Daytona 的替代品，而是它們的底層選項。**
+
+以下是深度解析：
+
+-----
+
+### 一、 什麼是 GKE Sandbox？(技術本質)
+
+Google 在 GKE 裡提供的 "Sandbox" 功能，技術核心是 **gVisor**。
+普通的 Docker 容器是和宿主機共享內核（Kernel）的。如果 Agent 運行了一段惡意 C 代碼去攻擊內核，整個 GKE 節點都會掛掉。
+
+**GKE Sandbox (gVisor)** 在容器和內核之間加了一層「攔截器」（用戶態內核）。
+
+  * **優點：** 極致安全。Agent 怎麼折騰都出不去。
+  * **缺點：** 性能損耗（Syscall 慢），以及**兼容性限制**。
+
+-----
+
+### 二、 GKE Sandbox 方案 vs. DinD/Daytona 方案的區別
+
+如果你決定使用「GKE Sandbox」來實現你的 Namek 項目，這意味著什麼？
+
+#### 1\. 實現難度：簡單 vs. 極難
+
+  * **開啟它（簡單）：**
+    你只需要在 GKE Node Pool 上打個勾，然後在 Pod YAML 裡加一行：
+
+    ```yaml
+    spec:
+      runtimeClassName: gvisor  # <--- 就這一步
+    ```
+
+  * **用好它（極難）：**
+    這是最大的坑。**gVisor 對「嵌套容器」(Running Docker inside gVisor) 的支持非常有限且複雜。**
+
+      * **場景：** 你的 Agent 寫完代碼，想運行 `docker build` 或者 `docker-compose up` 來測試數據庫連接。
+      * **DinD 方案：** 只要給 `privileged: true`，立刻就能跑。
+      * **GKE Sandbox 方案：** gVisor 設計初衷就是為了隔離，它**不支持** `privileged` 模式。要在 gVisor 裡跑 Docker，你需要非常高深的配置技巧（使用 Rootless Docker，且性能很差），甚至很多功能根本跑不起來。
+
+#### 2\. 架構對比表
+
+| 特性 | 方案 A：普通 GKE + DinD (Daytona/OpenHands 默認) | 方案 B：GKE Sandbox (gVisor) |
+| :--- | :--- | :--- |
+| **安全性** | **低/中**<br>依賴 `privileged` 權限，有逃逸風險。 | **極高**<br>內核級隔離，適合運行不可信代碼。 |
+| **Agent 能力** | **全能**<br>Agent 可以調用 Docker 啟動 Redis/MySQL 進行集成測試。 | **受限**<br>Agent 很難在 Sandbox 裡再啟動 Docker 容器。<br>只能運行純代碼（Python/Node/Go）。 |
+| **運維難度** | **中**<br>需要管理 Docker 緩存和清理。 | **高 (針對 Agent 場景)**<br>一旦 Agent 需要系統級調用，容易報錯。 |
+| **兼容性** | OpenHands/Daytona 原生支持。 | OpenHands 可能會因為缺少某些 Syscall 而崩潰。 |
+
+-----
+
+### 三、 什麼情況下該選 GKE Sandbox？
+
+只有滿足以下 **所有** 條件時，你才應該考慮強行上 GKE Sandbox：
+
+1.  **公司安全紅線：** Security 團隊發布死命令：「絕對禁止在 GKE 上運行 `privileged` 容器」，否則不讓上線。
+2.  **任務類型單一：** 你的 Agent **只需要** 修改代碼和運行單元測試（Unit Test），**不需要** 啟動依賴服務（如數據庫容器）來進行集成測試。
+3.  **基礎設施分離：** 你有一個獨立的、非容器化的 CI 系統（如 Jenkins VM）來處理 Docker 構建和集成測試。
+
+**如果你的 Agent 需要「全棧能力」（自己起庫、自己測、自己 Build），GKE Sandbox (gVisor) 會成為你的攔路虎。**
+
+-----
+
+### 四、 推薦的路徑：折中方案 (The "Sysbox" Way)
+
+如果你既想要 DinD 的功能，又擔心 `privileged` 的安全問題，**Sysbox** 是目前業界最佳實踐（比 GKE Sandbox 更適合開發環境）。
+
+但是，考慮到你是在公司內部 GKE，安裝 Sysbox 需要動節點配置，可能比較難。
+
+**所以，回到最現實的落地建議：**
+
+#### 1\. 短期（快速出成果）
+
+使用 **OpenHands + 普通 GKE Pod + DinD**。
+
+  * **如何規避風險？**
+      * 將這些 Pod 部署在一個**單獨的 GKE Node Pool**。
+      * 給這個 Node Pool 打上 Taint (污點)，不讓其他業務 Pod 調度過來。
+      * 配置 NetworkPolicy，鎖死這個 Namespace 的出站流量（只允許訪問 GitHub 和內網 LLM，禁止訪問公司敏感數據庫）。
+      * **理由：** 即使 Agent 逃逸了，它也只是控制了一個專門用來跑 Agent 的隔離節點，損失可控。
+
+#### 2\. 長期（Daytona 集成）
+
+部署 **Daytona**。
+
+  * Daytona 默認也是創建普通 Pod。
+  * 但是 Daytona 的架構允許你未來對接不同的 Provider。
+  * 如果未來公司支持了更安全的 Runtime (如 Kata Containers 或 Sysbox)，你只需要切換 Daytona 的配置，而不需要重寫 Agent 代碼。
+
+### 總結
+
+**GKE Agent Sandbox (gVisor) 實現難度：**
+
+  * **部署難度：** 極低（GCP 控制台點一下）。
+  * **開發適配難度：** **極高**。因為它閹割了 Agent 進行複雜操作（特別是 Docker 操作）的能力。
+
+**我的建議：**
+不要從 GKE Sandbox (gVisor) 開始。對於一個自動化編程項目，**「Agent 能順利調用 Docker」** 是核心需求。
+請採用 **Daytona (管理層) + 獨立 Node Pool (隔離層)** 的策略來平衡功能與安全。
+
