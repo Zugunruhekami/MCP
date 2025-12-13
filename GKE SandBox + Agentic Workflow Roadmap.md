@@ -571,6 +571,200 @@ Sandbox 現成的： 你立刻擁有了文件系統隔離、命令執行、超�
 總結
 你原來的構想（DeepAgents）在「邏輯編排」上很強，但在「環境基礎設施」上是缺失的。OpenHands 補全了這一塊。
 
+
+----
+
+
+這是一個非常關鍵的架構決策點。針對你的情況（GKE 環境、企業內部、已有的 Node.js 投資），我的核心建議是：
+
+**絕對不要（Absolutely DO NOT）簡單地把 OpenHands 整個項目 Clone/Copy 到你的 Namek Repo 裡面進行填充。**
+
+這會導致你陷入巨大的維護泥潭（Merge Conflict 地獄），並且 OpenHands 的全棧架構（FastAPI + React）會和你現有的架構打架。
+
+你應該採用 **「微服務分離」** 或 **「SDK 集成」** 的模式。考慮到你現有的 Node.js Probot 架構和未來的擴展性，以下是最佳實踐路徑：
+
+-----
+
+### 一、 核心決策：如何集成 OpenHands？
+
+#### 推薦方案：Sidecar / Worker 模式 (使用 OpenHands SDK)
+
+你需要將 `Namek` 拆分為兩個邏輯部分：
+
+1.  **Namek Controller (Node.js - 現有):** 負責輕量級業務，如 Webhook 接收、Symphony/Teams 消息轉發、權限校驗。
+2.  **Namek Worker (Python - 新增):** 負責重型任務。這裡引入 **OpenHands SDK** 作為依賴庫，用來驅動 Sandbox 和 Agent。
+
+**為什麼這樣做？**
+
+  * **解耦：** Probot (Node.js) 在處理 GitHub 事件流方面非常成熟，保留它。OpenHands SDK (Python) 在處理 Agent Runtime 和 LLM 交互上最強，利用它。
+  * **狀態管理：** GitHub Webhooks 是瞬時的，而 Agent Coding 是 Long-running 的。你需要一個異步機制（Queue）來連接這兩者。
+
+-----
+
+### 二、 架構設計：GKE 上的 Namek 2.0
+
+```mermaid
+graph TD
+    subgraph "External / Corporate Tools"
+        User[Symphony / Teams]
+        GHE[GitHub Enterprise]
+        LLM[LiteLLM / Vertex AI]
+    end
+
+    subgraph "Namek Namespace (GKE)"
+        subgraph "Controller Pod (Node.js)"
+            Probot[Probot App]
+            QueueProd[Task Producer]
+        end
+
+        MQ[Redis / PubSub]
+
+        subgraph "Worker Pod (Python)"
+            Worker[Task Consumer]
+            OH_SDK[OpenHands SDK]
+            CustomAgent[Custom Coding Logic]
+        end
+
+        subgraph "Sandbox Infrastructure"
+            DIND[Docker-in-Docker Sidecar]
+            Sandbox1[Agent Sandbox Container]
+            Sandbox2[Agent Sandbox Container]
+        end
+    end
+
+    User --> Probot
+    GHE --Webhook--> Probot
+    Probot --Job--> MQ
+    MQ --Job--> Worker
+    Worker --Uses--> OH_SDK
+    OH_SDK --Create/Exec--> DIND
+    DIND --Spawn--> Sandbox1
+    Sandbox1 --Git/Test--> GHE
+    Worker --Chat/Edit--> LLM
+```
+
+-----
+
+### 三、 具體實施步驟 (Action Plan)
+
+#### 1\. 保留 Node.js 層作為入口 (Controller)
+
+繼續開發你目前的 Node.js App。當收到 `issue_comment` (例如 `/fix this`) 或 `pull_request` 事件時，不要直接在 Node.js 裡處理複雜邏輯，而是將任務 Payload 發送到一個消息隊列（簡單的 Redis 甚至數據庫表都可以）。
+
+#### 2\. 新建 Python 服務集成 OpenHands SDK (Worker)
+
+在同一個 Repo 或新 Repo 中創建一個 Python 項目。
+**不要 Clone 代碼，而是安裝包：**
+*(注：OpenHands 目前正在拆分 SDK，如果官方 PyPI 尚未完全穩定，可以使用 `pip install git+https://github.com/All-Hands-AI/OpenHands.git` 指定 commit)*
+
+編寫你的 `worker.py`：
+
+```python
+import asyncio
+from openhands.core.main import create_runtime
+from openhands.controller.agent import Agent
+from openhands.core.config import AppConfig, SandboxConfig
+
+# 這是你的核心 Worker 邏輯
+async def process_task(repo_url, issue_description, token):
+    # 1. 配置 Runtime (GKE 自研 Sandbox 的關鍵)
+    # OpenHands 默認支持通過 Docker Socket 管理容器
+    config = AppConfig(
+        sandbox=SandboxConfig(
+            runtime="docker",  # 在 GKE Pod 裡連接 DIND Sidecar
+            image="your-company-registry/namek-sandbox-base:latest", # 預裝了 git, python, java 等
+            enable_auto_lint=True
+        ),
+        workspace_base="/workspace",
+    )
+
+    # 2. 創建 Runtime (這一步會自動在 GKE 裡拉起一個隔離容器)
+    runtime = create_runtime(config)
+    await runtime.connect()
+
+    # 3. 初始化 Agent (這裡可以用 OpenHands 內置的，也可以用 LangGraph 自定義)
+    # 關鍵：這裡配置 LiteLLM
+    agent = Agent(
+        llm_config={
+            "model": "vertex_ai/gemini-pro-1.5", # 通過 LiteLLM
+            "base_url": "http://your-internal-litellm-service",
+            "api_key": "sk-internal"
+        }
+    )
+
+    # 4. 執行任務 (Long-running)
+    instruction = f"Checkout {repo_url}. Fix this issue: {issue_description}. Run tests."
+    state = await agent.run(runtime, instruction)
+
+    # 5. 獲取結果並清理
+    print(state.history)
+    await runtime.close()
+
+# 模擬從 Queue 獲取任務
+if __name__ == "__main__":
+    asyncio.run(process_task(...))
+```
+
+#### 3\. 解決 GKE Sandbox 問題 (The "Secret Sauce")
+
+這是最棘手的部分。在 GKE 上，你不能隨便啟動 Docker。你需要配置 **Docker-in-Docker (DinD)** 模式。
+
+在你的 `deployment.yaml` 中，給 Python Worker Pod 添加一個 Sidecar：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: namek-worker
+spec:
+  template:
+    spec:
+      containers:
+        # 你的 Python Worker (運行 OpenHands SDK)
+        - name: worker
+          image: namek-worker:latest
+          env:
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375
+        
+        # DIND Sidecar (OpenHands 通過它來創建 Sandbox)
+        - name: dind
+          image: docker:dind
+          securityContext:
+            privileged: true # 這是必須的，除非使用 Kaniko 等無特權構建，但運行時通常需要 privileged
+            # 如果公司安全策略禁止 privileged，則需要使用 Sysbox 運行時或 GKE Sandbox (gVisor) + 用戶態 Docker
+```
+
+-----
+
+### 四、 回答你的具體困惑
+
+1.  **LangChain DeepAgents vs. OpenHands SDK?**
+
+      * **DeepAgents** 是一個「編排邏輯庫」，它假設你有現成的 Sandbox API (Runloop/Daytona)。如果你用它，你得自己寫代碼去對接 GKE 的 Docker。
+      * **OpenHands SDK** 是一個「全棧能力庫」，它自帶了 `DockerRuntime`。這意味著**它幫你寫好了對接 Docker/GKE 的代碼**。這對你來說價值巨大。
+
+2.  **LiteLLM / Vertex AI 兼容性？**
+
+      * OpenHands 底層完全使用 LiteLLM。這意味著只要 LiteLLM 能連上你們內部的 Vertex AI，OpenHands 就能用。完全不受 Claude Agent SDK 的 beta header 限制。
+      * 你甚至可以配置 OpenHands 使用你們內部的自託管模型（如 Llama 3 on GKE）。
+
+3.  **Claude Agent SDK (原 Claude Code) 還有用嗎？**
+
+      * 暫時忘掉它。它目前對 Anthropic 服務綁定太緊，且在處理「自定義 Sandbox」時不如 OpenHands 靈活。
+
+4.  **GitHub Enterprise 無 Actions 怎麼辦？**
+
+      * 這正是 Sandbox 的用途。你的 Agent 不僅僅是「寫代碼」，它還要在 Sandbox 裡「運行 CI」。
+      * 流程：Agent 改代碼 -\> Agent 在 Sandbox 運行 `npm test` -\> Agent 看到測試通過 -\> Agent 提交 PR。你把 CI/CD 的一部分職責前置到了 Agent 階段。
+
+### 五、 總結建議
+
+1.  **不要 Clone Repo:** 把 OpenHands 當作一個 Python 依賴包（SDK）來使用。
+2.  **雙服務架構:** Node.js (Controller) + Python (Worker w/ OpenHands SDK)。
+3.  **基礎設施:** 在 GKE 上配置 DIND Sidecar，讓 OpenHands SDK 能生成 Sandbox 容器。
+4.  **下一步:** 先在本地（Local Docker）跑通 Python SDK 調用 LiteLLM 完成一個簡單的 `git clone` + `echo hello` 任務，然後再搬到 GKE 上。
+
 建議下一步： 在 GKE 開發環境中部署一個 OpenHands 實例（使用其 Docker 鏡像），配置好 LiteLLM 指向內部模型，嘗試跑通一個簡單的 GitHub Issue 修復任務。這將是你構建 Namek 最快的起點。
 
 OpenHands - AI Software Engineer Relevance: This video provides a comprehensive visual walkthrough of OpenHands (formerly OpenDevin), demonstrating its runtime architecture, browser interaction capabilities, and self-hosted setup, which directly addresses your need for a GKE-compatible sandbox solution.
