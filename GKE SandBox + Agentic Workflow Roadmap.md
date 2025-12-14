@@ -1588,3 +1588,385 @@ spec:
 **現在就去做：**
 不要去管 DeepAgents 或者 Claude Agent SDK 了。專注於 **Probot (Node) + OpenHands SDK (Python) + Restabuild** 這三者的串聯。這是最符合你公司現狀的落地路徑。
 
+---
+
+這是一個非常明智的戰略轉向。從「全自動編程」轉向「高價值輔助（Triage & Review）」是企業落地 AI Agent 成功率最高的路徑。這相當於先僱傭一個「極速實習生」負責整理看板和初步代碼審查，而不是直接僱傭一個高級工程師。
+
+根據我對 **OpenHands 源碼**（特別是其 `core.llm` 和 `controller` 模塊）的分析，OpenHands 的核心價值在於它封裝了極其健壯的 LLM 交互層（基於 LiteLLM）和 Prompt 管理。
+
+對於你現在的需求（Tagging, Review, Project Mgmt），我們**不需要** OpenHands 裡面的 `DockerRuntime` 或 `Sandbox`。我們只需要它的 **「大腦」**。
+
+以下是基於 **Namek** 項目的輕量化架構實現方案。
+
+-----
+
+### 一、 架構設計：Namek 輕量化版
+
+我們保持 **Node.js Probot** 作為「耳朵」（監聽），引入 **Python Worker** 作為「大腦」（思考）。
+
+  * **Node.js (Probot):** 負責監聽 `issues.opened`, `pull_request.opened`。它不思考，只負責把數據轉發給 Python。
+  * **Python (Worker):** 使用 `openhands-ai` 的 LLM 組件。
+      * **Triage Agent:** 負責 Issue 分類（Tagging）和 GitHub Projects 管理。
+      * **Review Agent:** 負責 PR 代碼審查。
+
+-----
+
+### 二、 具體代碼實現
+
+#### 1\. Node.js Controller (`index.js`) - 轉發者
+
+這是你現有的 Probot App，只需要修改處理邏輯，將事件轉發給 Python 服務。
+
+```javascript
+/**
+ * Namek Controller (Node.js)
+ * 職責：接收 Webhook，將 Payload 轉發給內部 Python 服務
+ */
+const axios = require('axios');
+
+module.exports = (app) => {
+  const WORKER_URL = process.env.WORKER_URL || 'http://namek-worker:8000';
+
+  // 1. 自動 Triage & Project 管理
+  app.on('issues.opened', async (context) => {
+    const issue = context.payload.issue;
+    app.log.info(`Processing issue #${issue.number} for triage`);
+    
+    // 異步轉發，不阻塞 GitHub 響應
+    axios.post(`${WORKER_URL}/triage`, {
+      repo_name: context.payload.repository.full_name,
+      issue_number: issue.number,
+      title: issue.title,
+      body: issue.body,
+      html_url: issue.html_url,
+      node_id: issue.node_id // 用於 GraphQL (Projects)
+    }).catch(err => app.log.error(err));
+  });
+
+  // 2. 自動 PR Review
+  app.on('pull_request.opened', async (context) => {
+    const pr = context.payload.pull_request;
+    app.log.info(`Processing PR #${pr.number} for review`);
+
+    axios.post(`${WORKER_URL}/review`, {
+      repo_name: context.payload.repository.full_name,
+      pr_number: pr.number,
+      diff_url: pr.diff_url, // Python 端會去下載 diff
+      installation_id: context.payload.installation.id
+    }).catch(err => app.log.error(err));
+  });
+};
+```
+
+-----
+
+#### 2\. Python Worker (`worker.py`) - 核心邏輯
+
+這裡我們借鑑 **OpenHands** 的 `LLM` 封裝來保證與 LiteLLM 的穩定連接。
+
+**依賴安裝：**
+
+```bash
+pip install fastapi uvicorn PyGithub litellm openhands-ai
+```
+
+**代碼實現：**
+
+```python
+import os
+import requests
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+from github import Github, GithubIntegration
+
+# 引入 OpenHands 的 LLM 配置 (這是 OpenHands 的核心優勢之一)
+from openhands.core.config import LLMConfig
+from openhands.core.llm import LLM
+
+app = FastAPI()
+
+# --- 配置初始化 ---
+# 使用 OpenHands 的 LLM 類，它完美封裝了 LiteLLM 的重試和錯誤處理
+llm_config = LLMConfig(
+    model="vertex_ai/gemini-pro-1.5", # 或 internal/claude-3-5-sonnet
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    temperature=0.1
+)
+brain = LLM(llm_config)
+
+# GitHub 客戶端初始化 (你需要處理 App 的私鑰認證)
+# 這裡簡化為使用 Token，生產環境建議使用 github app private key
+gh = Github(os.getenv("GITHUB_TOKEN"))
+
+# --- Agent 1: Triage Agent (Tagging & Projects) ---
+def run_triage_agent(data: dict):
+    repo = gh.get_repo(data['repo_name'])
+    issue = repo.get_issue(data['issue_number'])
+
+    # 1. 自動打標籤 (Auto Tagging)
+    prompt = f"""
+    You are a GitHub Issue Manager. Analyze the following issue and suggest 1-3 labels from this list: 
+    ['bug', 'feature', 'documentation', 'enhancement', 'question', 'critical'].
+    
+    Title: {data['title']}
+    Body: {data['body']}
+    
+    Return ONLY a python list of strings, e.g. ['bug', 'critical'].
+    """
+    
+    # 調用 OpenHands LLM
+    response = brain.completion(messages=[{"role": "user", "content": prompt}])
+    suggested_labels = eval(response.choices[0].message.content) # 注意：生產環境請用 regex 解析
+    
+    if suggested_labels:
+        issue.add_to_labels(*suggested_labels)
+        print(f"Added labels {suggested_labels} to #{issue.number}")
+
+    # 2. 自動添加到 GitHub Projects (Jira Replacement)
+    # 這是 Project V2 (Memex)，必須用 GraphQL
+    # 邏輯：如果是 'bug' -> 放進 'Triage' 列；如果是 'feature' -> 放進 'Backlog'
+    project_id = os.getenv("GITHUB_PROJECT_NODE_ID") # 需要預先獲取你們 Org 的 Project ID
+    
+    if project_id:
+        add_to_project_mutation(data['node_id'], project_id)
+
+def add_to_project_mutation(content_id, project_id):
+    # 這是一個簡化的 GraphQL 調用
+    query = """
+    mutation($projectId: ID!, $contentId: ID!) {
+      addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+        item { id }
+      }
+    }
+    """
+    # 實際執行 requests.post 到 https://api.github.com/graphql ...
+    # 這裡省略具體 GraphQL 封裝代碼，重點是邏輯
+    pass
+
+# --- Agent 2: Review Agent (Auto PR Review) ---
+def run_review_agent(data: dict):
+    repo = gh.get_repo(data['repo_name'])
+    pr = repo.get_pull_request(data['pr_number'])
+    
+    # 獲取 Diff 內容
+    diff_content = requests.get(data['diff_url'], headers={"Authorization": f"token {os.getenv('GITHUB_TOKEN')}"}).text
+    
+    # 限制 Diff 長度，防止 Context 溢出
+    if len(diff_content) > 50000:
+        pr.create_issue_comment("Namek: PR too large for auto-review.")
+        return
+
+    prompt = f"""
+    You are a Senior Software Engineer. Review the following git diff.
+    Focus on: 
+    1. Potential bugs or logic errors.
+    2. Security vulnerabilities.
+    3. Code style consistency.
+    
+    If the code looks good, reply with "LGTM".
+    Otherwise, provide a concise list of feedback formatted in Markdown.
+    
+    DIFF:
+    {diff_content}
+    """
+    
+    response = brain.completion(messages=[{"role": "user", "content": prompt}])
+    review_comment = response.choices[0].message.content
+    
+    # 提交 Review
+    pr.create_issue_comment(f"🤖 **Namek Auto Review**\n\n{review_comment}")
+
+
+# --- API Endpoints ---
+class WebhookPayload(BaseModel):
+    repo_name: str
+    issue_number: int = None
+    pr_number: int = None
+    title: str = None
+    body: str = None
+    node_id: str = None # For GraphQL
+    diff_url: str = None
+    html_url: str = None
+
+@app.post("/triage")
+async def handle_triage(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    # 使用後台任務，不要阻塞 Probot 的請求
+    background_tasks.add_task(run_triage_agent, payload.dict())
+    return {"status": "queued"}
+
+@app.post("/review")
+async def handle_review(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_review_agent, payload.dict())
+    return {"status": "queued"}
+```
+
+-----
+
+### 三、 為什麼這個實現方案最適合你？
+
+1.  **去除了 Sandbox 複雜度：**
+
+      * 上面的代碼不需要 `Docker`，不需要 `Daytona`，也不需要 `gVisor`。
+      * 它只是一個純粹的 Python API 服務，利用 LLM 的文本處理能力。這極大降低了你在 GKE 上的部署難度和安全風險。
+
+2.  **利用了 OpenHands 的核心 (LLM Wrapper)：**
+
+      * 我們使用了 `openhands.core.config.LLMConfig` 和 `LLM` 類。
+      * 這意味著你獲得了 OpenHands 團隊針對 LiteLLM 調優過的所有好處（Token 計算、統一接口、錯誤重試），而沒有引入它的重量級運行時。
+
+3.  **GitHub Projects (Jira 替代品) 的關鍵點：**
+
+      * 代碼中提到的 `GraphQL` 是關鍵。Probot (REST API) 對 Project V2 的支持很差。你需要手寫一個簡單的 GraphQL Client（或者用 `gql` 庫）來將 Issue 塞進 Project 的特定 Column（Field）。
+      * **Agent 價值：** Agent 不僅是把 Issue 加進去，它可以根據 Issue 的內容判斷：「這是一個緊急 Bug，我應該把它直接放到 'Todo' 列並標記 Priority 為 High」。這是 Jira Automation 很難做到的智能判斷。
+
+4.  **未來擴展性：**
+
+      * 當你以後想做「Agent 自動修復 Bug」時，你只需要在這個 Python Worker 裡引入 OpenHands 的 `Runtime` 模塊，這套架構完全不用變。
+
+### 四、 下一步行動建議
+
+1.  **部署 Python Worker：** 將上述 `worker.py` 打包成 Docker 鏡像，部署到 GKE，與你的 Node.js App 在同一個 Namespace。
+2.  **配置 GitHub Projects：** 在 GitHub Enterprise 裡創建一個 Organization 級別的 Project V2。獲取它的 `Project ID` 和字段定義 (Fields IDs)。
+3.  **Prompt 調優：**
+      * 對於 Tagging，把你們公司常用的 Label 定義寫進 Prompt。
+      * 對於 Review，把你們公司的 Coding Style Guide (比如 "We follow Google Java Style") 寫進 Prompt。
+
+這個方案可以在 **1-2 天內** 落地，立刻給團隊帶來價值，同時避開了 Sandbox 的運維深坑。
+
+
+---
+
+你問得非常深刻。這直接觸及了 **LLM（大語言模型）應用**與 **AI Agent（智能體）** 的本質區別。
+
+簡單來說：**對於「看一眼就能解決」的任務，你目前的架構是對的（Stateless LLM）；但對於「需要試錯和探索」的任務，你需要 OpenHands/LangGraph（Stateful Agent）。**
+
+你的觀察很準確：如果你只是做 Triage（分類）和簡單 Review（文本分析），**你確實不需要 OpenHands SDK，也不需要 LangGraph**，甚至連 Sandbox 都不需要。
+
+但為什麼 OpenHands、SWE-Agent 這類項目如此重要？它們解決了「簡單 LLM + Prompt」絕對無法解決的三大難題：**幻覺驗證、上下文探索、長期規劃**。
+
+以下我結合你的 `Namek` 項目場景，進行深度實戰對比分析：
+
+-----
+
+### 一、 核心區別：一次性生成 vs. 循環反饋 (The Loop)
+
+#### 1\. 當下場景：Auto Triage / Simple Review
+
+  * **模式：** `Input -> LLM -> Output` (直線流程)
+  * **為什麼不需要 Agent：**
+      * 判斷 Issue 是 Bug 還是 Feature，LLM 看標題和內容就夠了。
+      * 簡單 Review，LLM 掃一眼 Diff 就能看出變量命名不規範或明顯的邏輯漏洞。
+      * **結論：** 這不是 Agent，這是 **NLP 任務**。你目前的 `requests.post` + Prompt 方案是**最優解**，效率最高，成本最低。
+
+#### 2\. 未來場景：修復一個具體的 Bug
+
+  * **任務：** "Issue \#405: 用戶登錄時如果密碼包含特殊字符會報錯 500。"
+
+  * **簡單 LLM + Prompt 的做法：**
+
+      * 你把相關代碼（假設你能找到）餵給 LLM。
+      * LLM 說：「我改好了，把 `password` encode 一下。」
+      * **結局：** 你把代碼合入，上線後發現**報錯變成了 400，或者引發了另一個 NullPointerException**。LLM 是一次性的，它**不知道**自己改對了沒有。
+
+  * **OpenHands / Agent 的做法 (The OODA Loop)：**
+
+      * **觀察 (Observe):** Agent 先運行 `grep` 搜索代碼庫，找到登錄邏輯在哪個文件（**這是 LLM + Prompt 做不到的，因為它沒有手**）。
+      * **行動 (Act):** Agent 編寫一個「復現腳本」(reproduce\_issue.py)，運行它，確認報錯確實是 500。
+      * **思考 (Think):** "原來是 Regex 寫錯了。"
+      * **行動 (Act):** 修改源代碼。
+      * **驗證 (Verify):** **再次運行**復現腳本。
+      * **反饋 (Feedback):** 腳本報錯 "Syntax Error"。
+      * **修正 (Correct):** Agent 看到報錯，自我修正代碼。
+      * **最終驗證:** 腳本通過，測試通過。
+      * **結論：** 這就是 OpenHands 的價值——**它是 LLM 的「手」和「眼睛」，讓 LLM 具備了「改錯」的能力。**
+
+-----
+
+### 二、 為什麼你需要 OpenHands SDK / LangGraph？
+
+如果你嘗試用「簡單 LLM + Prompt」去寫一個循環來模倣上述過程，你會撞上以下幾堵墻，而這些正是 OpenHands 幫你解決的：
+
+#### 1\. 解析與容錯 (Parsing & Robustness)
+
+  * **問題：** 你告訴 LLM "修改文件 A"，LLM 可能會返回 JSON，也可能返回 Markdown，甚至返回一段 Python 代碼。
+  * **OpenHands SDK 的價值：** 它定義了嚴格的 **Action Interface**。它負責把 LLM 亂七八糟的輸出 Parse 成標準的 `CmdRunAction`, `FileWriteAction`。如果 Parse 失敗，SDK 會自動 Catch 錯誤並告訴 LLM "格式錯了，請重試"。
+  * **沒有它：** 你得寫幾千行 Regex 來處理各種 Edge Case。
+
+#### 2\. 上下文管理 (Context Management)
+
+  * **問題：** 你的公司 Repo 可能有 100 個文件，幾萬行代碼。你不能把整個 Repo 塞進 Prompt（Token 會爆，費用會炸，Vertex AI 會拒絕）。
+  * **OpenHands 的價值：** 它是**有狀態的**。
+      * Agent 可以在 Sandbox 裡運行 `ls -R` 看目錄結構。
+      * Agent 可以 `cat utils.py` 只讀取它需要的文件。
+      * **OpenHands 維護了一個 "Trajectory" (軌跡)**，它知道自己看過哪些文件，做過哪些嘗試。它只把「當前最相關」的信息餵給 LLM，而不是全部。
+
+#### 3\. 工具調用標準 (Tooling Standard)
+
+  * **問題：** 你需要讓 Agent 能運行 Shell 命令、編輯文件、打開瀏覽器。
+  * **OpenHands 的價值：** 它封裝了 `DockerRuntime` (或 Daytona/Local)。
+      * 當 Agent 說 "Run test"，SDK 會自動通過 Docker Socket 在隔離環境執行，並把 Stdout/Stderr 截獲回來給 Agent 看。
+      * **瀏覽器交互：** 這點最重要。OpenHands 集成了 Browser Gym/Browser Use。讓 LLM 能看懂網頁（Accessibility Tree / Screenshot），這不是簡單 Prompt 能做到的，需要複雜的觀察空間轉換。
+
+-----
+
+### 三、 實戰代碼對比
+
+**場景：你的 Namek 項目要實現「自動升級依賴包並修復破壞的測試」。**
+
+#### 方案 A：你的現狀 (LLM + Prompt)
+
+```python
+# 你只能做到這一步
+diff = "package.json changed: react 17 -> 18"
+prompt = f"React 升級到了 18，請預測哪些代碼會壞掉？\n{code_snippet}"
+# LLM 只能瞎猜。它沒法運行 npm test，不知道具體哪個 Component 掛了。
+```
+
+#### 方案 B：使用 OpenHands SDK (Agentic)
+
+```python
+from openhands.controller.agent import Agent
+from openhands.core.schema import AgentState
+
+# 這是一個循環，不是一次調用
+while agent.state != AgentState.FINISHED:
+    # 1. SDK 自動收集 Sandbox 的輸出 (比如 npm test 的報錯)
+    observation = runtime.read_output()
+    
+    # 2. SDK 處理 Prompt History，壓縮不重要的信息
+    # 3. SDK 調用 LiteLLM 獲取下一步動作
+    action = agent.step(observation)
+    
+    # 4. SDK 執行動作 (比如修改文件，或者運行 ls)
+    runtime.run_action(action)
+    
+    # 比如 Agent 發現測試失敗，它會決定去讀那個報錯的文件
+    # 下一輪循環，它會嘗試修復那個文件
+    # 再下一輪，它會再次運行 npm test
+```
+
+### 四、 結論與建議
+
+**現在的 OpenHands/Open-SWE 的價值在於：**
+它把 LLM 從一個 **「只會說話的咨詢師」** 變成了一個 **「會動手的工程師」**。
+
+**針對你的 Namek 項目路線圖：**
+
+1.  **當下 (Triage/Review):**
+
+      * **不需要** OpenHands Runtime/SDK。
+      * 繼續使用你現在的 `Node.js -> Python API -> LiteLLM` 模式。這是最輕量、最穩定的。
+
+2.  **中期 (Auto Fix / Unit Test Generation):**
+
+      * **必須引入 Agent。** 當你想讓 Namek 不僅僅是 "Comment" 而是 "Commit Code" 時。
+      * **那時再引入 OpenHands SDK。** 因為你需要它來幫你管理 `Docker` 環境，確保代碼改完能跑通。
+
+3.  **長期 (Browser Testing / End-to-End):**
+
+      * **必須依賴 Sandbox。** 當你想讓 Agent 打開網頁看 UI 有沒有崩。
+      * 這時 OpenHands + BrowserUse 的價值就體現出來了。
+
+**一句話總結：**
+不要為了用框架而用框架。在你需要 **「運行代碼」** 或 **「多步推理」** 之前，你現在的 "Prompt Engineering" 方案就是最完美的架構。OpenHands 是你未來的「武器庫」，等你要打硬仗（寫代碼）時再拿出來。
